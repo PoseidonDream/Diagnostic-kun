@@ -8,8 +8,11 @@ It is **read-only**: it never changes settings, deletes files or installs anythi
 
 ## How to run
 
-1. Download or clone this folder.
+1. Go to [**Releases**](https://github.com/PoseidonDream/diagnostic-kun/releases), download
+   `Diagnostic-kun-<version>.zip`, and unzip it (right-click > Extract All).
 2. Double-click **`RunDiagnostic.bat`** and accept the administrator prompt.
+   If Windows shows "Windows protected your PC", click **More info** > **Run anyway**
+   (this appears for any downloaded script that isn't code-signed).
 3. When it finishes (usually 30-90 seconds), the HTML report opens in your browser.
 
 Reports are saved in the `Reports` folder as `Diagnostic_<PC>_<date>.html` plus a
