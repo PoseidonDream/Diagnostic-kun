@@ -106,6 +106,10 @@ if ($share) {
 $code = Invoke-Tool @('-GuiSelfTest', '-OutputDir', $reports)
 Assert-That ($code -eq 0) "Window self-test passes (exit code $code)"
 
+# 6b. Starting without -OutputDir (as RunDiagnostic.bat does) works and uses the Reports folder
+$code = Invoke-Tool @('-GuiSelfTest')
+Assert-That ($code -eq 0) "Starts with the default Reports folder (exit code $code)"
+
 # 7. Weekly check on and off
 $code = Invoke-Tool @('-InstallSchedule', '-OutputDir', $reports)
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue

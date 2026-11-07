@@ -54,7 +54,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$OutputDir = (Join-Path $PSScriptRoot 'Reports'),
+    [string]$OutputDir,
     [ValidateRange(1, 365)][int]$Days = 7,
     [switch]$Quick,
     [switch]$NoOpen,
@@ -79,6 +79,9 @@ if ($env:OS -ne 'Windows_NT') { [Console]::Error.WriteLine('This tool only runs 
 $script:Version = 'dev'          # replaced with the release number by build/Build-Package.ps1
 $script:TaskName = 'Diagnostic-kun weekly check'
 $script:KeepRuns = 30            # older reports in the Reports folder are deleted after this many
+# Default set here, not in param(): Windows PowerShell 5.1 leaves $PSScriptRoot empty
+# while it evaluates parameter defaults, which made every run without -OutputDir fail.
+if (-not $OutputDir) { $OutputDir = Join-Path $PSScriptRoot 'Reports' }
 $OutputDir = $OutputDir.TrimEnd('\')
 
 # ---------------------------------------------------------------------------
@@ -500,7 +503,10 @@ function Get-SensorReadings {
         try { $p.Kill() } catch {}
         $note = 'The sensor library did not answer within 60 seconds.'
     } elseif (Test-Path $tmp) {
-        $readings = @((Get-Content $tmp -Raw | ConvertFrom-Json).Readings)
+        $res = Get-Content $tmp -Raw | ConvertFrom-Json
+        $readings = @($res.Readings | Where-Object { $_ })
+        $err = Get-Prop $res 'Error'
+        if ($err) { $note = "The sensor library failed: $err" }
     } else {
         $note = "The sensor library failed to load (exit code $($p.ExitCode))."
     }
@@ -716,13 +722,15 @@ function Test-Gpu {
     foreach ($g in $gpus) {
         $drvDate = $g.DriverDate
         $age = if ($drvDate) { [math]::Round(((Get-Date) - $drvDate).TotalDays / 365, 1) } else { $null }
+        # Drivers that ship with Windows use the placeholder date 21 June 2006, so their age means nothing
+        $inbox = $drvDate -and $drvDate.Year -eq 2006 -and $drvDate.Month -eq 6 -and $drvDate.Day -eq 21
         $vram = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { ", $(Format-GB ([uint32]$g.AdapterRAM))+ VRAM" } else { '' }
         $txt = "$($g.Name)$vram, driver $($g.DriverVersion)$(if ($drvDate) { ' (' + $drvDate.ToString('yyyy-MM-dd') + ')' })"
         if ($g.ConfigManagerErrorCode -ne 0 -or $g.Status -ne 'OK') {
             Add-Result 'Graphics' "GPU: $($g.Name)" 'Critical' "$txt - device error code $($g.ConfigManagerErrorCode), status $($g.Status)." 'Reinstall the graphics driver from the GPU maker (NVIDIA / AMD / Intel).' -FixId open-devmgr
         } elseif ($g.Name -match 'Basic Display|Basic Render') {
             Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - Windows is using the generic display driver." 'Install the proper graphics driver from your GPU or PC maker.' -FixId open-update
-        } elseif ($null -ne $age -and $age -gt $T.DriverOldYears) {
+        } elseif ($null -ne $age -and -not $inbox -and $age -gt $T.DriverOldYears) {
             Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - driver is $age years old." 'Update the graphics driver.' -FixId open-update
         } else { Add-Result 'Graphics' "GPU: $($g.Name)" 'OK' $txt }
     }
@@ -1128,6 +1136,16 @@ function Test-Housekeeping {
     } catch {}
 }
 
+# True when a TCP connection to Host:Port opens within the timeout
+function Test-TcpPort {
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if ($ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.EndConnect($ar); $true } else { $false }
+    } catch { $false } finally { $client.Close() }
+}
+
 function Test-Network {
     $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and -not $_.Virtual })
     if ($up.Count -eq 0) {
@@ -1149,6 +1167,8 @@ function Test-Network {
     $targets = [ordered]@{}
     if ($gw -and $gw -ne '0.0.0.0') { $targets['Router'] = $gw }
     $targets['Internet'] = '1.1.1.1'
+    # Many networks block ping, so check whether web connections work before calling a failed ping a fault
+    $webOk = (Test-TcpPort '1.1.1.1' 443) -or (Test-TcpPort 'www.microsoft.com' 443)
     foreach ($k in $targets.Keys) {
         $ok = 0; $lat = @()
         for ($i = 0; $i -lt 4; $i++) {
@@ -1158,7 +1178,8 @@ function Test-Network {
         $loss = 100 - $ok * 25
         $avg = if ($lat.Count) { [math]::Round(($lat | Measure-Object -Average).Average) } else { $null }
         $txt = "$k ($($targets[$k])): $loss% loss$(if ($null -ne $avg) { ", avg $avg ms" })."
-        if ($ok -eq 0) { Add-Result 'Network' "Ping $k" 'Critical' $txt $(if ($k -eq 'Router') { 'Cannot reach the router - check Wi-Fi/cable.' } else { 'No internet - restart the router or contact your ISP.' }) }
+        if ($ok -eq 0 -and $webOk) { Add-Result 'Network' "Ping $k" 'Info' "$txt It does not answer ping, but web connections work (many networks block ping)." }
+        elseif ($ok -eq 0) { Add-Result 'Network' "Ping $k" 'Critical' $txt $(if ($k -eq 'Router') { 'Cannot reach the router - check Wi-Fi/cable.' } else { 'No internet - restart the router or contact your ISP.' }) }
         elseif ($loss -ge $T.PingLossWarnPct -or $avg -ge $T.PingLatencyWarnMs) { Add-Result 'Network' "Ping $k" 'Warning' $txt 'Unstable connection; move closer to Wi-Fi or use a cable.' }
         else { Add-Result 'Network' "Ping $k" 'OK' $txt }
     }
@@ -1860,7 +1881,13 @@ function Show-DiagnosticWindow {
 # ===========================================================================
 $script:PauseAtEnd = $false
 
-if ($SensorProbe) { Invoke-SensorProbe -OutFile $SensorProbe; exit 0 }
+if ($SensorProbe) {
+    try { Invoke-SensorProbe -OutFile $SensorProbe; exit 0 }
+    catch {
+        [pscustomobject]@{ Readings = @(); Error = $_.Exception.GetBaseException().Message } | ConvertTo-Json | Set-Content -Path $SensorProbe -Encoding UTF8
+        exit 1
+    }
+}
 if ($InstallSchedule) { $when = Install-WeeklyCheck; Write-Host "Weekly check turned on: every $when."; exit 0 }
 if ($RemoveSchedule) { Remove-WeeklyCheck; Write-Host 'Weekly check turned off.'; exit 0 }
 if ($GuiSelfTest) { Show-DiagnosticWindow -SelfTest; Write-Host 'Window self-test passed.'; exit 0 }
