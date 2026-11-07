@@ -71,9 +71,25 @@ if (-not $SkipSensorLibrary) {
     Write-Host "Sensor library files:" ((Get-ChildItem $lib).Name -join ', ')
 }
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 $zip = Join-Path $dist "Diagnostic-kun-v$Version.zip"
-[IO.Compression.ZipFile]::CreateFromDirectory($pkg, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
+# Add files one by one with forward-slash paths. ZipFile.CreateFromDirectory in Windows
+# PowerShell writes backslashes, which 7-Zip and non-Windows tools unpack into one folder.
+$pkgFull = (Resolve-Path $pkg).Path.TrimEnd('\')
+$archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in Get-ChildItem -Path $pkgFull -Recurse -File) {
+        $entry = 'Diagnostic-kun/' + $file.FullName.Substring($pkgFull.Length + 1).Replace('\', '/')
+        $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entry, [IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally { $archive.Dispose() }
+$check = [IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    $names = @($check.Entries | ForEach-Object { $_.FullName })
+    if (@($names | Where-Object { $_.Contains('\') }).Count -gt 0) { throw 'Zip contains backslash paths.' }
+    if ($names -notcontains 'Diagnostic-kun/Diagnostic-kun.bat') { throw 'Zip is missing Diagnostic-kun/Diagnostic-kun.bat.' }
+    Write-Host "Zip entries:" ($names -join ', ')
+} finally { $check.Dispose() }
 $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
 Set-Content -Path (Join-Path $dist 'SHA256.txt') -Value "$hash  $(Split-Path $zip -Leaf)" -Encoding ASCII
 Write-Host "Built $zip"
