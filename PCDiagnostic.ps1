@@ -517,7 +517,8 @@ function Get-SensorReadings {
 function Test-Sensors {
     if (-not $script:IsAdmin) { Skip-NoAdmin 'Temperatures' 'Temperatures and fans'; return }
     $probe = Get-SensorReadings
-    $readings = @($probe.Readings | Where-Object { $_ })
+    # Without the PawnIO driver some sensors report 0 C instead of nothing; ignore impossible values
+    $readings = @($probe.Readings | Where-Object { $_ -and -not ($_.Kind -eq 'Temperature' -and $_.Value -le 0) })
     $hasLib = $probe.Note -ne 'NoLibrary'
     if ($probe.Note -and $hasLib) { Add-Result 'Temperatures' 'Sensor library' 'Info' $probe.Note }
 
@@ -1523,6 +1524,12 @@ function Invoke-Scan {
     [pscustomobject]@{ Data = $data; Html = "$base.html"; Json = "$base.json"; Shareable = $share }
 }
 
+# Opens the report through Explorer, so the browser does not inherit administrator rights
+function Open-Report {
+    param([string]$Path)
+    if ($Path -and (Test-Path $Path)) { Start-Process explorer.exe -ArgumentList "`"$Path`"" }
+}
+
 function Write-ConsoleSummary {
     param($Run)
     $d = $Run.Data
@@ -1854,7 +1861,7 @@ function Show-DiagnosticWindow {
     $ui.Timer.add_Tick({ Invoke-Safely { Update-ScanState } })
     $ui.Cancel.add_Click({ $script:ui.Form.Close() })
     $ui.RunFix.add_Click({ Invoke-Safely { Invoke-GuiFixes } })
-    $ui.Open.add_Click({ Invoke-Safely { Start-Process $script:GuiHtml } })
+    $ui.Open.add_Click({ Invoke-Safely { Open-Report $script:GuiHtml } })
     $ui.Share.add_Click({ Invoke-Safely { Save-ShareableCopy } })
     $ui.Weekly.add_Click({ Invoke-Safely { Switch-WeeklyCheck } })
     $ui.Again.add_Click({ Invoke-Safely { Start-GuiScan } })
@@ -1926,7 +1933,7 @@ try {
             Show-Notification 'Diagnostic-kun found a serious problem' "$what. Click to open the report." $run.Html
         }
     } else {
-        if (-not $NoOpen) { Start-Process $run.Html }
+        if (-not $NoOpen) { Open-Report $run.Html }
         if ($Fix) { Invoke-FixMenu $run.Data }
     }
     if ($script:PauseAtEnd) { $null = Read-Host 'Press Enter to close' }
