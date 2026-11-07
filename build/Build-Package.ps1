@@ -26,15 +26,15 @@ $pkg = Join-Path $dist 'Diagnostic-kun'
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Path $pkg | Out-Null
 
-foreach ($f in 'PCDiagnostic.ps1', 'RunDiagnostic.bat', 'README.md', 'THIRD-PARTY-NOTICES.md') {
+foreach ($f in 'Diagnostic-kun.ps1', 'Diagnostic-kun.bat', 'README.md', 'THIRD-PARTY-NOTICES.md') {
     Copy-Item -LiteralPath (Join-Path $root $f) -Destination $pkg
 }
 
 # Stamp the version into the packaged script
-$ps1 = Join-Path $pkg 'PCDiagnostic.ps1'
+$ps1 = Join-Path $pkg 'Diagnostic-kun.ps1'
 $text = [IO.File]::ReadAllText($ps1)
 $marker = "`$script:Version = 'dev'"
-if (-not $text.Contains($marker)) { throw "Version marker not found in PCDiagnostic.ps1" }
+if (-not $text.Contains($marker)) { throw "Version marker not found in Diagnostic-kun.ps1" }
 [IO.File]::WriteAllText($ps1, $text.Replace($marker, "`$script:Version = '$Version'"))
 
 if (-not $SkipSensorLibrary) {

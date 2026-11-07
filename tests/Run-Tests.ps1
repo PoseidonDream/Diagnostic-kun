@@ -13,7 +13,7 @@ param([string]$PackageDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-$script = Join-Path (Resolve-Path $PackageDir) 'PCDiagnostic.ps1'
+$script = Join-Path (Resolve-Path $PackageDir) 'Diagnostic-kun.ps1'
 $ps = Join-Path $PSHOME 'powershell.exe'
 $reports = Join-Path ([IO.Path]::GetTempPath()) 'dk-test-reports'
 if (Test-Path $reports) { Remove-Item $reports -Recurse -Force }
@@ -30,13 +30,13 @@ function Assert-That {
 function Invoke-Tool {
     param([string[]]$Arguments)
     $ErrorActionPreference = 'Continue'
-    Write-Host "> PCDiagnostic.ps1 $($Arguments -join ' ')" -ForegroundColor Cyan
+    Write-Host "> Diagnostic-kun.ps1 $($Arguments -join ' ')" -ForegroundColor Cyan
     & $ps -NoProfile -ExecutionPolicy Bypass -File $script @Arguments 2>&1 | ForEach-Object { Write-Host "    $_" }
     $LASTEXITCODE
 }
 
 function Get-LatestReport {
-    $f = Get-ChildItem -Path $reports -Filter 'Diagnostic_*.json' | Sort-Object LastWriteTime | Select-Object -Last 1
+    $f = Get-ChildItem -Path $reports -Filter 'Diagnostic-kun_*.json' | Sort-Object LastWriteTime | Select-Object -Last 1
     if (-not $f) { return $null }
     [pscustomobject]@{ File = $f; Data = (Get-Content $f.FullName -Raw | ConvertFrom-Json) }
 }
@@ -106,7 +106,7 @@ if ($share) {
 $code = Invoke-Tool @('-GuiSelfTest', '-OutputDir', $reports)
 Assert-That ($code -eq 0) "Window self-test passes (exit code $code)"
 
-# 6b. Starting without -OutputDir (as RunDiagnostic.bat does) works and uses the Reports folder
+# 6b. Starting without -OutputDir (as Diagnostic-kun.bat does) works and uses the Reports folder
 $code = Invoke-Tool @('-GuiSelfTest')
 Assert-That ($code -eq 0) "Starts with the default Reports folder (exit code $code)"
 

@@ -1,6 +1,6 @@
 # Diagnostic-kun
 
-A Windows 10/11 PC health check. It looks at the hardware and software of the PC,
+Diagnostic-kun is a Windows 10/11 PC health check. It looks at the hardware and software of the PC,
 rates every check **OK / Info / Warning / Critical**, explains each problem with a
 suggested fix, and shows what changed since the last scan.
 
@@ -10,7 +10,7 @@ Scanning is **read-only**. Nothing on the PC changes unless you pick a fix and c
 
 1. Go to [**Releases**](https://github.com/PoseidonDream/Diagnostic-kun/releases), download
    `Diagnostic-kun-<version>.zip`, and unzip it (right-click > Extract All).
-2. Double-click **`RunDiagnostic.bat`** and accept the administrator prompt.
+2. Double-click **`Diagnostic-kun.bat`** and accept the administrator prompt.
    If Windows shows "Windows protected your PC", click **More info** > **Run anyway**
    (this appears for any downloaded script that isn't code-signed).
 3. A window shows a progress bar, then the results. From there you can:
@@ -25,7 +25,7 @@ Scanning is **read-only**. Nothing on the PC changes unless you pick a fix and c
    - **Scan again**: for example after running fixes.
 
 Reports are saved in the `Reports` folder (the newest 30 scans are kept) as
-`Diagnostic_<PC>_<date>.html` plus a `.json` copy.
+`Diagnostic-kun_<PC>_<date>.html` plus a `.json` copy.
 
 ### Temperatures and fan speeds
 
@@ -40,13 +40,13 @@ graphics cards and to the approximate temperatures some laptops report to Window
 From a PowerShell prompt as administrator:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1                # scan and open the report
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Fix           # then offer fixes in the console
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Days 30       # look at 30 days of event logs
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Quick         # skip DISM and network tests
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Shareable     # also write the shareable copy
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -InstallSchedule   # weekly check on
-powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -RemoveSchedule    # weekly check off
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1                # scan and open the report
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -Fix           # then offer fixes in the console
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -Days 30       # look at 30 days of event logs
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -Quick         # skip DISM and network tests
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -Shareable     # also write the shareable copy
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -InstallSchedule   # weekly check on
+powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -RemoveSchedule    # weekly check off
 ```
 
 Exit code: `0` = all OK, `1` = warnings (or a check could not run), `2` = critical problems, `3` = the tool itself failed.
@@ -80,7 +80,7 @@ went away, and numbers such as free space, SSD wear, battery wear and crash coun
 
 ## Adjusting what counts as a problem
 
-All limits are in the `$T` table at the top of `PCDiagnostic.ps1`, for example
+All limits are in the `$T` table at the top of `Diagnostic-kun.ps1`, for example
 `DiskFreeWarnPct = 15` or `UpdateWarnDays = 45`. Change them and re-run.
 
 ## Help test it

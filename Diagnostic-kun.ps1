@@ -28,7 +28,7 @@
 
 .PARAMETER Gui
     Shows a window with a progress bar, the results, and buttons for fixes,
-    a shareable report and the weekly check. RunDiagnostic.bat uses this.
+    a shareable report and the weekly check. Diagnostic-kun.bat uses this.
 
 .PARAMETER Fix
     Console mode: after the scan, list the available fixes and ask which to run.
@@ -48,9 +48,9 @@
     Used by the weekly task: no window, notification only when needed.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1
-    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Days 30 -Quick -Fix
-    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -InstallSchedule
+    powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1
+    powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -Days 30 -Quick -Fix
+    powershell -ExecutionPolicy Bypass -File .\Diagnostic-kun.ps1 -InstallSchedule
 #>
 [CmdletBinding()]
 param(
@@ -231,7 +231,7 @@ function Invoke-Native {
 }
 
 function Skip-NoAdmin { param([string]$Cat, [string]$Name)
-    Add-Result $Cat $Name 'Skipped' 'Needs administrator rights.' 'Run RunDiagnostic.bat (it asks for admin rights) for this check.'
+    Add-Result $Cat $Name 'Skipped' 'Needs administrator rights.' 'Run Diagnostic-kun.bat (it asks for admin rights) for this check.'
 }
 
 # ===========================================================================
@@ -1208,7 +1208,7 @@ function Test-Network {
 # ===========================================================================
 function Get-PreviousData {
     param([string]$Dir, [string]$ExcludePath)
-    $files = @(Get-ChildItem -Path $Dir -Filter "Diagnostic_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
+    $files = @(Get-ChildItem -Path $Dir -Filter "Diagnostic-kun_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
                Where-Object { $_.FullName -ne $ExcludePath } | Sort-Object LastWriteTime -Descending)
     foreach ($f in $files) {
         try { return (Get-Content $f.FullName -Raw | ConvertFrom-Json) } catch {}
@@ -1395,7 +1395,7 @@ function Write-Report {
     $html = @"
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PC Diagnostic - $computer</title>
+<title>Diagnostic-kun - $computer</title>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#667085;--line:#e4e7ec;--ok:#12805c;--info:#2e6fd8;--warn:#b26b00;--crit:#c4282d;--skip:#8a8f98}
 @media (prefers-color-scheme:dark){:root{--bg:#14161b;--card:#1d2027;--fg:#e8eaee;--mut:#9aa1ad;--line:#2d313a;--ok:#3cc28f;--info:#6b9ff0;--warn:#e9a23b;--crit:#f0646a;--skip:#8a8f98}}
@@ -1418,7 +1418,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:7px 14px;border-top:1px 
 .box{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:auto}
 @media (max-width:640px){.sec td:nth-child(2){width:auto}td,th{padding:6px 10px}th{width:auto}.chg{grid-template-columns:1fr}}
 </style></head><body><main>
-<h1>PC Diagnostic Report</h1>
+<h1>Diagnostic-kun report</h1>
 <div class="sub">$computer &middot; $generated &middot; event logs checked for the last $days days$adminNote</div>
 $shareNote
 <div class="hero" style="--ov:var(--$ovColor)"><b>$headline</b>
@@ -1448,7 +1448,7 @@ function Write-ScanProgress {
 
 function Remove-OldReports {
     param([string]$Dir)
-    $old = @(Get-ChildItem -Path $Dir -Filter "Diagnostic_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
+    $old = @(Get-ChildItem -Path $Dir -Filter "Diagnostic-kun_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
              Sort-Object LastWriteTime -Descending | Select-Object -Skip $script:KeepRuns)
     foreach ($f in $old) {
         $base = Join-Path $f.DirectoryName ([IO.Path]::GetFileNameWithoutExtension($f.Name))
@@ -1493,7 +1493,7 @@ function Invoke-Scan {
     Write-ScanProgress "$($checks.Count)|$($checks.Count)|Writing the report"
 
     if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
-    $base = Join-Path $OutputDir ("Diagnostic_{0}_{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
+    $base = Join-Path $OutputDir ("Diagnostic-kun_{0}_{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
     $counts = [ordered]@{}
     foreach ($s in 'Critical', 'Error', 'Warning', 'Info', 'Skipped', 'OK') { $counts[$s] = @($script:Results | Where-Object { $_.Status -eq $s }).Count }
     $data = [pscustomobject]@{
@@ -1554,7 +1554,7 @@ function Test-WeeklyCheck { [bool](Get-ScheduledTask -TaskName $script:TaskName 
 
 # Returns a description of when it runs, e.g. "Monday at 12:00".
 function Install-WeeklyCheck {
-    if (-not $script:IsAdmin) { throw 'Turning on the weekly check needs administrator rights. Start Diagnostic-kun with RunDiagnostic.bat.' }
+    if (-not $script:IsAdmin) { throw 'Turning on the weekly check needs administrator rights. Start Diagnostic-kun with Diagnostic-kun.bat.' }
     $exe = Join-Path $PSHOME 'powershell.exe'
     $argLine = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Scheduled -OutputDir `"$OutputDir`" -Days 7"
     $day = (Get-Date).DayOfWeek
@@ -1691,7 +1691,7 @@ function Update-ScanState {
         $state = Read-ScanProgress   # it may have finished between the two reads
         if ($state -and $state[0] -eq 'done') { Complete-GuiScan $state; return }
         $ui.Timer.Stop()
-        $ui.Step.Text = "The scan stopped unexpectedly (exit code $($script:ScanProc.ExitCode)). Close this window and run RunDiagnostic.bat again."
+        $ui.Step.Text = "The scan stopped unexpectedly (exit code $($script:ScanProc.ExitCode)). Close this window and run Diagnostic-kun.bat again."
     }
 }
 
@@ -1815,9 +1815,9 @@ function Show-DiagnosticWindow {
     $f.BackColor = [System.Drawing.Color]::White
     $ui.Form = $f
 
-    $title = New-Ctl Label 20 12 860 36 'PC health check' 'Top,Left,Right'
+    $title = New-Ctl Label 20 12 860 36 'Diagnostic-kun' 'Top,Left,Right'
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
-    $sub = New-Ctl Label 22 50 860 24 'Checks your hardware and software. Nothing on the PC changes unless you choose a fix.' 'Top,Left,Right'
+    $sub = New-Ctl Label 22 50 860 24 'PC health check for your hardware and software. Nothing on the PC changes unless you choose a fix.' 'Top,Left,Right'
     $sub.ForeColor = [System.Drawing.Color]::DimGray
 
     # While scanning

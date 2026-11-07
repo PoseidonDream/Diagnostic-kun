@@ -17,6 +17,6 @@ if %errorlevel% neq 0 (
     exit /b
 )
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0PCDiagnostic.ps1" -Gui %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Diagnostic-kun.ps1" -Gui %*
 :: Exit code 3 means the tool itself failed: keep the window open so the error can be read.
 if errorlevel 3 pause
