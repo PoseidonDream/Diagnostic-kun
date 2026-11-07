@@ -1,5 +1,5 @@
 @echo off
-:: PC Diagnostic launcher - asks for admin rights, then runs the PowerShell script.
+:: Diagnostic-kun launcher - asks for admin rights, then opens the Diagnostic-kun window.
 :: "fltmc" only succeeds when elevated. ("net session" also fails as admin when the
 :: Server service is off, which made the launcher re-launch itself forever.)
 fltmc >nul 2>&1
@@ -17,5 +17,6 @@ if %errorlevel% neq 0 (
     exit /b
 )
 cd /d "%~dp0"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0PCDiagnostic.ps1" %*
-pause
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0PCDiagnostic.ps1" -Gui %*
+:: Exit code 3 means the tool itself failed: keep the window open so the error can be read.
+if errorlevel 3 pause

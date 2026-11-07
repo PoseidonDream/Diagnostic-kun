@@ -1,0 +1,48 @@
+name: Problem report
+description: Something went wrong, or a check gave a wrong result on your PC
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Diagnostic-kun on your PC!
+        Please attach the **shareable** report: click **Save shareable copy** in the window.
+        It hides your PC name, user name and installed programs. GitHub does not accept
+        .html files, so right-click it > Send to > Compressed (zipped) folder, and attach the zip.
+  - type: input
+    id: version
+    attributes:
+      label: Diagnostic-kun version
+      description: Shown in the window title
+      placeholder: e.g. 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows version
+      options: [Windows 11, Windows 10, Windows Server, Other]
+    validations:
+      required: true
+  - type: input
+    id: language
+    attributes:
+      label: Windows display language
+      placeholder: e.g. English, German, Japanese
+  - type: dropdown
+    id: pc
+    attributes:
+      label: Type of PC
+      options: [Desktop, Laptop, Virtual machine]
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Which check was wrong, or what error did you see? What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Shareable report
+      description: Drag the zipped _shareable.html file here.

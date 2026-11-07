@@ -1,0 +1,89 @@
+name: Build and test
+
+# Runs on every push to main and on pull requests: builds the zip and tests it on
+# a real Windows machine. To publish a release: Actions > "Build and test" >
+# "Run workflow", and enter a version number.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'To publish a release, enter a version number like 0.2.0. Leave empty to only build and test.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the zip
+        shell: powershell
+        env:
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          $v = if ($env:VERSION) { $env:VERSION } else { 'dev' }
+          .\build\Build-Package.ps1 -Version $v
+
+      - name: Test on Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Run-Tests.ps1 -PackageDir dist\Diagnostic-kun
+
+      - name: Keep the zip
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            dist/*.zip
+            dist/SHA256.txt
+          if-no-files-found: ignore
+
+      - name: Keep the test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: test-reports/
+          if-no-files-found: ignore
+
+  release:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: dist
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION#v}"
+          ZIP="dist/Diagnostic-kun-v${VERSION}.zip"
+          HASH="$(cut -d' ' -f1 dist/SHA256.txt)"
+          sed -e "s/{{VERSION}}/${VERSION}/g" -e "s/{{SHA256}}/${HASH}/g" -e "s|{{REPO}}|${GITHUB_REPOSITORY}|g" build/release-notes.md > notes.md
+          FLAGS=()
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+          gh release create "v${VERSION}" "$ZIP" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Diagnostic-kun v${VERSION}" --notes-file notes.md "${FLAGS[@]}"

@@ -6,9 +6,13 @@
 .DESCRIPTION
     Runs a set of read-only checks (it changes nothing on the PC) and rates each
     one OK, Info, Warning or Critical. Results are saved as an HTML report and a
-    JSON file. Run as Administrator for complete results; without admin rights
-    some checks (disk health counters, BitLocker, TPM, Secure Boot, DISM) are
+    JSON file, and each report shows what changed since the previous scan.
+    Run as Administrator for complete results; without admin rights some checks
+    (disk health counters, temperatures, BitLocker, TPM, Secure Boot, DISM) are
     skipped and marked as such.
+
+    Fixes are never applied automatically: the window (-Gui) and the console
+    menu (-Fix) only run a fix after you choose it and confirm.
 
 .PARAMETER OutputDir
     Folder for the reports. Defaults to a "Reports" folder next to this script.
@@ -22,21 +26,60 @@
 .PARAMETER NoOpen
     Do not open the HTML report when finished.
 
+.PARAMETER Gui
+    Shows a window with a progress bar, the results, and buttons for fixes,
+    a shareable report and the weekly check. RunDiagnostic.bat uses this.
+
+.PARAMETER Fix
+    Console mode: after the scan, list the available fixes and ask which to run.
+
+.PARAMETER Shareable
+    Also write a copy of the report without the PC name, user name and
+    installed programs, for sending to someone who is helping you.
+
+.PARAMETER InstallSchedule
+    Turns on a weekly background check that shows a notification only when
+    something becomes critical. Needs administrator rights.
+
+.PARAMETER RemoveSchedule
+    Turns the weekly background check off.
+
+.PARAMETER Scheduled
+    Used by the weekly task: no window, notification only when needed.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1
-    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Days 30 -Quick
+    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -Days 30 -Quick -Fix
+    powershell -ExecutionPolicy Bypass -File .\PCDiagnostic.ps1 -InstallSchedule
 #>
 [CmdletBinding()]
 param(
     [string]$OutputDir = (Join-Path $PSScriptRoot 'Reports'),
     [ValidateRange(1, 365)][int]$Days = 7,
     [switch]$Quick,
-    [switch]$NoOpen
+    [switch]$NoOpen,
+    [switch]$Gui,
+    [switch]$Fix,
+    [switch]$Shareable,
+    [switch]$InstallSchedule,
+    [switch]$RemoveSchedule,
+    [switch]$Scheduled,
+    # Internal: used by the window and the tests
+    [Parameter(DontShow)][string]$ProgressFile,
+    [Parameter(DontShow)][string]$SensorProbe,
+    [Parameter(DontShow)][switch]$GuiSelfTest
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ($env:OS -ne 'Windows_NT') { [Console]::Error.WriteLine('This tool only runs on Windows.'); exit 2 }
+
+$script:Version = 'dev'          # replaced with the release number by build/Build-Package.ps1
+$script:TaskName = 'Diagnostic-kun weekly check'
+$script:KeepRuns = 30            # older reports in the Reports folder are deleted after this many
+$OutputDir = $OutputDir.TrimEnd('\')
 
 # ---------------------------------------------------------------------------
 # Thresholds - adjust here to make the tool stricter or more lenient.
@@ -52,8 +95,10 @@ $T = @{
     CpuLoadWarnPct      = 85     # sustained CPU load over the sample
     MemUsedWarnPct      = 85
     MemUsedCritPct      = 95
-    ThermalWarnC        = 85
+    ThermalWarnC        = 85     # CPU temperature
     ThermalCritC        = 95
+    GpuTempWarnC        = 85
+    GpuTempCritC        = 95
     BatteryWearWarnPct  = 30     # capacity lost vs design
     BatteryWearCritPct  = 50
     UptimeWarnDays      = 14
@@ -70,6 +115,9 @@ $T = @{
 }
 
 $script:Results = New-Object System.Collections.Generic.List[object]
+$script:Metrics = New-Object System.Collections.Generic.List[object]
+$script:Overview = [ordered]@{}
+$script:InstalledApps = @()
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
                   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $Since = (Get-Date).AddDays(-$Days)
@@ -77,13 +125,17 @@ $Since = (Get-Date).AddDays(-$Days)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+# The FixId parameter names an entry in $script:FixActions (below) that the window
+# and the -Fix menu can offer for this result; FixArg is passed to it (a drive, a service...).
 function Add-Result {
     param(
         [Parameter(Mandatory)][string]$Category,
         [Parameter(Mandatory)][string]$Check,
         [Parameter(Mandatory)][ValidateSet('OK', 'Info', 'Warning', 'Critical', 'Skipped', 'Error')][string]$Status,
         [string]$Detail = '',
-        [string]$Fix = ''
+        [string]$Fix = '',
+        [string]$FixId = '',
+        [string]$FixArg = ''
     )
     $script:Results.Add([pscustomobject]@{
         Category = $Category
@@ -91,7 +143,42 @@ function Add-Result {
         Status   = $Status
         Detail   = $Detail
         Fix      = $Fix
+        FixId    = $FixId
+        FixArg   = $FixArg
     })
+}
+
+# A number that is compared with the previous scan ("free space 120 GB -> 98 GB").
+# -PerWindow marks counts over the last -Days days, only compared when -Days matches.
+function Add-Metric {
+    param(
+        [string]$Name,
+        [double]$Value,
+        [string]$Unit = '',
+        [switch]$HigherIsWorse,
+        [double]$MinChange = 1,
+        [switch]$PerWindow
+    )
+    $script:Metrics.Add([pscustomobject]@{
+        Name          = $Name
+        Value         = [math]::Round($Value, 1)
+        Unit          = $Unit
+        HigherIsWorse = [bool]$HigherIsWorse
+        MinChange     = $MinChange
+        PerWindow     = [bool]$PerWindow
+    })
+}
+
+# Reads a property from a hashtable or object, or returns $Default when it is
+# missing (reports saved by older versions lack newer fields).
+function Get-Prop {
+    param($Obj, [string]$Name, $Default = $null)
+    if ($null -eq $Obj) { return $Default }
+    if ($Obj -is [System.Collections.IDictionary]) {
+        if ($Obj.Contains($Name)) { return $Obj[$Name] } else { return $Default }
+    }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $Default }
 }
 
 # Runs one check block; any unexpected failure becomes an "Error" row instead
@@ -145,6 +232,104 @@ function Skip-NoAdmin { param([string]$Cat, [string]$Name)
 }
 
 # ===========================================================================
+# FIXES - only ever run after the user picks them and confirms
+# ===========================================================================
+# Title may contain {0}, replaced by the result's FixArg.
+$script:FixActions = [ordered]@{
+    'cleanmgr'        = @{ Title = 'Open Disk Cleanup for drive {0}'
+                           Run   = { param($a) Start-Process cleanmgr.exe -ArgumentList "/d $($a.TrimEnd(':'))" } }
+    'chkdsk'          = @{ Title = 'Check and repair drive {0} with chkdsk (the system drive is checked at the next restart)'
+                           Run   = { param($a) Start-Process cmd.exe -ArgumentList "/k chkdsk $a /f" } }
+    'repair-system'   = @{ Title = 'Repair Windows system files with DISM and SFC (15-30 minutes, opens a window)'
+                           Run   = { Start-Process cmd.exe -ArgumentList '/k DISM /Online /Cleanup-Image /RestoreHealth && sfc /scannow' } }
+    'start-service'   = @{ Title = 'Start the "{0}" service'
+                           Run   = { param($a) Start-Service -Name $a } }
+    'wu-service'      = @{ Title = 'Turn the Windows Update service back on'
+                           Run   = { Set-Service wuauserv -StartupType Manual; Start-Service wuauserv } }
+    'open-update'     = @{ Title = 'Open Windows Update'
+                           Run   = { Start-Process 'ms-settings:windowsupdate' } }
+    'defender-on'     = @{ Title = 'Turn on Microsoft Defender real-time protection'
+                           Run   = {
+                               Set-MpPreference -DisableRealtimeMonitoring $false
+                               if (-not (Get-MpComputerStatus).RealTimeProtectionEnabled) {
+                                   throw 'Windows did not allow it (Tamper Protection or a policy). Turn it on in Windows Security.'
+                               } } }
+    'defender-update' = @{ Title = 'Update Microsoft Defender virus definitions'
+                           Run   = { Update-MpSignature } }
+    'open-security'   = @{ Title = 'Open Windows Security'
+                           Run   = { Start-Process 'windowsdefender:' } }
+    'firewall-on'     = @{ Title = 'Turn the Windows Firewall back on for all networks'
+                           Run   = { Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True } }
+    'open-devmgr'     = @{ Title = 'Open Device Manager to update or reinstall drivers'
+                           Run   = { Start-Process devmgmt.msc } }
+    'memory-test'     = @{ Title = 'Open Windows Memory Diagnostic (tests RAM during a restart)'
+                           Run   = { Start-Process mdsched.exe } }
+    'open-startup'    = @{ Title = 'Open Startup apps settings'
+                           Run   = { Start-Process 'ms-settings:startupapps' } }
+    'open-apps'       = @{ Title = 'Open "Programs and Features" to uninstall programs'
+                           Run   = { Start-Process appwiz.cpl } }
+    'time-sync'       = @{ Title = 'Turn Windows Time back on and sync the clock'
+                           Run   = { Set-Service W32Time -StartupType Manual; Start-Service W32Time; $null = Invoke-Native 'w32tm.exe' @('/resync') } }
+    'power-balanced'  = @{ Title = 'Switch to the Balanced power plan'
+                           Run   = { $null = Invoke-Native 'powercfg.exe' @('/setactive', 'SCHEME_BALANCED') } }
+    'renew-ip'        = @{ Title = 'Renew the network address (DHCP)'
+                           Run   = { $null = Invoke-Native 'ipconfig.exe' @('/renew') } }
+    'flush-dns'       = @{ Title = 'Clear the DNS cache'
+                           Run   = { Clear-DnsClientCache } }
+    'restart'         = @{ Title = 'Restart the PC in 1 minute (save your work first; cancel with "shutdown /a")'
+                           Run   = { $null = Invoke-Native 'shutdown.exe' @('/r', '/t', '60', '/c', 'Restarting to finish Windows updates (Diagnostic-kun)') } }
+}
+
+# The distinct fixes offered for a set of results, most severe first, restart last.
+function Get-AvailableFixes {
+    param($Results)
+    $rank = @{ Critical = 0; Warning = 1; Info = 2 }
+    $seen = @{}
+    $list = foreach ($r in @($Results)) {
+        $id = [string](Get-Prop $r 'FixId' '')
+        $arg = [string](Get-Prop $r 'FixArg' '')
+        if (-not $id -or -not $rank.ContainsKey([string]$r.Status) -or -not $script:FixActions.Contains($id)) { continue }
+        if ($seen.ContainsKey("$id|$arg")) { continue }
+        $seen["$id|$arg"] = $true
+        [pscustomobject]@{
+            Id     = $id
+            Arg    = $arg
+            Title  = $script:FixActions[$id].Title -f $arg
+            Reason = "$($r.Check) ($($r.Status))"
+            Order  = if ($id -eq 'restart') { 9 } else { $rank[[string]$r.Status] }
+        }
+    }
+    , @($list | Sort-Object Order)
+}
+
+function Invoke-Fix {
+    param($Item)
+    try {
+        & $script:FixActions[$Item.Id].Run $Item.Arg
+        "Done: $($Item.Title)"
+    } catch {
+        "Failed: $($Item.Title) - $($_.Exception.Message)"
+    }
+}
+
+# Console menu for -Fix
+function Invoke-FixMenu {
+    param($Data)
+    $fixes = Get-AvailableFixes $Data.Results
+    if ($fixes.Count -eq 0) { Write-Host '  No automatic fixes are available for the problems found.'; return }
+    Write-Host '  Fixes available (nothing runs unless you choose it):' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $fixes.Count; $i++) { Write-Host ("   [{0}] {1}  - for: {2}" -f ($i + 1), $fixes[$i].Title, $fixes[$i].Reason) }
+    $ans = Read-Host '  Type the numbers to run, separated by commas, or press Enter to skip'
+    $nums = @($ans -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ } |
+              Where-Object { $_ -ge 1 -and $_ -le $fixes.Count } | Select-Object -Unique)
+    foreach ($n in $nums) {
+        $f = $fixes[$n - 1]
+        if ((Read-Host "  Run '$($f.Title)'? (y/n)") -match '^\s*y') { Write-Host ('  ' + (Invoke-Fix $f)) }
+    }
+    if ($nums.Count -gt 0) { Write-Host '  Run the scan again to check the result.' }
+}
+
+# ===========================================================================
 # SYSTEM OVERVIEW
 # ===========================================================================
 function Test-SystemInfo {
@@ -167,7 +352,7 @@ function Test-SystemInfo {
     $uptime = (Get-Date) - $os.LastBootUpTime
     $d = [math]::Round($uptime.TotalDays, 1)
     if ($uptime.TotalDays -gt $T.UptimeWarnDays) {
-        Add-Result 'System' 'Uptime' 'Warning' "Running for $d days without a restart." 'Restart the PC; long uptimes leave updates pending and memory fragmented.'
+        Add-Result 'System' 'Uptime' 'Warning' "Running for $d days without a restart." 'Restart the PC; long uptimes leave updates pending and memory fragmented.' -FixId restart
     } else { Add-Result 'System' 'Uptime' 'OK' "Up for $d days." }
 
     # Support status of the Windows build: end-of-servicing dates (Microsoft lifecycle)
@@ -207,15 +392,15 @@ function Test-SystemInfo {
     if (-not $end -and $build -gt $maxKnown) {
         Add-Result 'System' 'Windows version' 'OK' "$label (newer than this tool's support table)."
     } elseif (-not $end) {
-        Add-Result 'System' 'Windows version' 'Critical' "$label is an old Windows release that no longer receives security updates." $upgradeFix
+        Add-Result 'System' 'Windows version' 'Critical' "$label is an old Windows release that no longer receives security updates." $upgradeFix -FixId open-update
     } elseif ($end -lt (Get-Date)) {
         if ($build -eq 19045) {
-            Add-Result 'System' 'Windows version' 'Warning' "Windows 10 22H2. Support ended $($end.ToString('yyyy-MM-dd')); updates only continue with Extended Security Updates (ESU)." 'Plan an upgrade to Windows 11 or enrol in Extended Security Updates.'
+            Add-Result 'System' 'Windows version' 'Warning' "Windows 10 22H2. Support ended $($end.ToString('yyyy-MM-dd')); updates only continue with Extended Security Updates (ESU)." 'Plan an upgrade to Windows 11 or enrol in Extended Security Updates.' -FixId open-update
         } else {
-            Add-Result 'System' 'Windows version' 'Critical' "$label - support for this release ended $($end.ToString('yyyy-MM-dd')); it no longer receives security updates." $upgradeFix
+            Add-Result 'System' 'Windows version' 'Critical' "$label - support for this release ended $($end.ToString('yyyy-MM-dd')); it no longer receives security updates." $upgradeFix -FixId open-update
         }
     } elseif (($end - (Get-Date)).TotalDays -le 90) {
-        Add-Result 'System' 'Windows version' 'Warning' "$label - support ends $($end.ToString('yyyy-MM-dd'))." $upgradeFix
+        Add-Result 'System' 'Windows version' 'Warning' "$label - support ends $($end.ToString('yyyy-MM-dd'))." $upgradeFix -FixId open-update
     } else {
         Add-Result 'System' 'Windows version' 'OK' "$label, supported until $($end.ToString('yyyy-MM-dd'))."
     }
@@ -251,21 +436,147 @@ function Test-Cpu {
     } else { Add-Result 'CPU' 'CPU load' 'OK' "Average load $avg% over 5 seconds." }
 }
 
-function Test-Thermal {
-    if (-not $script:IsAdmin) { Skip-NoAdmin 'CPU' 'Temperature'; return }
-    $zones = $null
-    try { $zones = @(Get-Cim MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi') } catch {}
-    if (-not $zones -or $zones.Count -eq 0) {
-        Add-Result 'CPU' 'Temperature' 'Skipped' 'This PC does not expose temperature sensors to Windows (common on desktops).' 'Use the manufacturer tool or HWiNFO for exact temperatures.'
-        return
+# --- Temperatures and fans -------------------------------------------------
+# The release zip ships LibreHardwareMonitorLib (MPL-2.0) in .\lib. It is loaded
+# in a separate PowerShell process (-SensorProbe) so that a crash or hang in the
+# sensor library cannot take the whole scan down. Without it, the check falls
+# back to nvidia-smi for NVIDIA GPUs and ACPI thermal zones for the CPU.
+$script:PawnIoUrl = 'https://github.com/namazso/PawnIO.Setup/releases'
+
+$script:ResolverSource = @'
+using System; using System.IO; using System.Reflection;
+public static class DkAssemblyResolver {
+    static string dir;
+    public static void Register(string d) { dir = d; AppDomain.CurrentDomain.AssemblyResolve += OnResolve; }
+    static Assembly OnResolve(object sender, ResolveEventArgs e) {
+        string p = Path.Combine(dir, new AssemblyName(e.Name).Name + ".dll");
+        return File.Exists(p) ? Assembly.LoadFrom(p) : null;
     }
-    $temps = $zones | ForEach-Object { [math]::Round(($_.CurrentTemperature / 10) - 273.15, 1) } | Where-Object { $_ -gt 0 -and $_ -lt 150 }
-    if (-not $temps) { Add-Result 'CPU' 'Temperature' 'Skipped' 'Sensors returned no usable readings.'; return }
-    $max = ($temps | Measure-Object -Maximum).Maximum
-    $txt = "Thermal zone readings: $(($temps | ForEach-Object { "$_ C" }) -join ', '). (ACPI zones are approximate.)"
-    if ($max -ge $T.ThermalCritC) { Add-Result 'CPU' 'Temperature' 'Critical' $txt 'Clean dust from fans and vents, check the cooler, replace thermal paste.' }
-    elseif ($max -ge $T.ThermalWarnC) { Add-Result 'CPU' 'Temperature' 'Warning' $txt 'Check airflow and fans.' }
-    else { Add-Result 'CPU' 'Temperature' 'OK' $txt }
+}
+'@
+
+# Child-process mode: read temperature and fan sensors, write them to $OutFile as JSON.
+function Invoke-SensorProbe {
+    param([string]$OutFile)
+    $dir = Join-Path $PSScriptRoot 'lib'
+    # powershell.exe has no binding redirects for the library's dependencies, so
+    # resolve any assembly from .\lib by name, whatever version is requested.
+    Add-Type -TypeDefinition $script:ResolverSource
+    [DkAssemblyResolver]::Register($dir)
+    $null = [Reflection.Assembly]::LoadFrom((Join-Path $dir 'LibreHardwareMonitorLib.dll'))
+    $computer = New-Object LibreHardwareMonitor.Hardware.Computer
+    $computer.IsCpuEnabled = $true
+    $computer.IsGpuEnabled = $true
+    $computer.IsMotherboardEnabled = $true
+    $computer.IsControllerEnabled = $true
+    $computer.Open()
+    $out = New-Object System.Collections.Generic.List[object]
+    try {
+        $all = New-Object System.Collections.Generic.List[object]
+        foreach ($h in $computer.Hardware) { $all.Add($h); foreach ($sub in $h.SubHardware) { $all.Add($sub) } }
+        foreach ($pass in 1..2) { foreach ($h in $all) { $h.Update() }; Start-Sleep -Milliseconds 500 }
+        foreach ($h in $all) {
+            foreach ($s in $h.Sensors) {
+                $kind = [string]$s.SensorType
+                if ($kind -in 'Temperature', 'Fan' -and $null -ne $s.Value) {
+                    $out.Add([pscustomobject]@{ Hardware = [string]$h.Name; Type = [string]$h.HardwareType; Sensor = [string]$s.Name; Kind = $kind; Value = [math]::Round([double]$s.Value, 1) })
+                }
+            }
+        }
+    } finally { $computer.Close() }
+    [pscustomobject]@{ Readings = $out.ToArray() } | ConvertTo-Json -Depth 3 | Set-Content -Path $OutFile -Encoding UTF8
+}
+
+function Get-SensorReadings {
+    $lib = Join-Path $PSScriptRoot 'lib\LibreHardwareMonitorLib.dll'
+    if (-not (Test-Path $lib)) { return [pscustomobject]@{ Readings = @(); Note = 'NoLibrary' } }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("dk_sensors_{0}.json" -f [guid]::NewGuid())
+    $exe = (Get-Process -Id $PID).Path
+    $p = Start-Process -FilePath $exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -SensorProbe `"$tmp`"" -WindowStyle Hidden -PassThru
+    $null = $p.Handle   # keeps the exit code readable after the process ends
+    $note = ''
+    $readings = @()
+    if (-not $p.WaitForExit(60000)) {
+        try { $p.Kill() } catch {}
+        $note = 'The sensor library did not answer within 60 seconds.'
+    } elseif (Test-Path $tmp) {
+        $readings = @((Get-Content $tmp -Raw | ConvertFrom-Json).Readings)
+    } else {
+        $note = "The sensor library failed to load (exit code $($p.ExitCode))."
+    }
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Readings = $readings; Note = $note }
+}
+
+function Test-Sensors {
+    if (-not $script:IsAdmin) { Skip-NoAdmin 'Temperatures' 'Temperatures and fans'; return }
+    $probe = Get-SensorReadings
+    $readings = @($probe.Readings | Where-Object { $_ })
+    $hasLib = $probe.Note -ne 'NoLibrary'
+    if ($probe.Note -and $hasLib) { Add-Result 'Temperatures' 'Sensor library' 'Info' $probe.Note }
+
+    # NVIDIA fallback when the library gave no GPU temperatures
+    if (-not @($readings | Where-Object { $_.Kind -eq 'Temperature' -and $_.Type -like 'Gpu*' })) {
+        $smi = @("$env:SystemRoot\System32\nvidia-smi.exe", "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($smi) {
+            foreach ($line in @(Invoke-Native $smi @('--query-gpu=name,temperature.gpu', '--format=csv,noheader,nounits'))) {
+                $f = $line -split ',\s*'
+                if ($f.Count -ge 2 -and $f[1] -match '^\d+$') {
+                    $readings += [pscustomobject]@{ Hardware = $f[0]; Type = 'GpuNvidia'; Sensor = 'GPU Core'; Kind = 'Temperature'; Value = [double]$f[1] }
+                }
+            }
+        }
+    }
+
+    # CPU
+    $cpuT = @($readings | Where-Object { $_.Kind -eq 'Temperature' -and $_.Type -eq 'Cpu' })
+    $main = @($cpuT | Where-Object { $_.Sensor -match 'Package|Tctl|Tdie|Core Max' })
+    if ($main.Count -eq 0) { $main = $cpuT }
+    if ($main.Count -gt 0) {
+        $max = ($main | Measure-Object -Property Value -Maximum).Maximum
+        $txt = "$($main[0].Hardware): $max C (measured while the scan was running)."
+        if ($max -ge $T.ThermalCritC) { Add-Result 'Temperatures' 'CPU temperature' 'Critical' $txt 'Clean dust from fans and vents, check the cooler is seated and its fan spins, renew thermal paste.' }
+        elseif ($max -ge $T.ThermalWarnC) { Add-Result 'Temperatures' 'CPU temperature' 'Warning' $txt 'Check airflow and that all fans spin; clean dust from vents.' }
+        else { Add-Result 'Temperatures' 'CPU temperature' 'OK' $txt }
+    } else {
+        # ACPI thermal zones: approximate, and missing on many desktops
+        $zones = @()
+        try { $zones = @(Get-Cim MSAcpi_ThermalZoneTemperature -Namespace 'root/wmi') } catch {}
+        $temps = @($zones | ForEach-Object { [math]::Round(($_.CurrentTemperature / 10) - 273.15, 1) } | Where-Object { $_ -gt 0 -and $_ -lt 150 })
+        if ($temps.Count -gt 0) {
+            $max = ($temps | Measure-Object -Maximum).Maximum
+            $txt = "Thermal zone readings: $(($temps | ForEach-Object { "$_ C" }) -join ', '). (ACPI zones are approximate.)"
+            if ($max -ge $T.ThermalCritC) { Add-Result 'Temperatures' 'CPU temperature' 'Critical' $txt 'Clean dust from fans and vents, check the cooler, replace thermal paste.' }
+            elseif ($max -ge $T.ThermalWarnC) { Add-Result 'Temperatures' 'CPU temperature' 'Warning' $txt 'Check airflow and fans.' }
+            else { Add-Result 'Temperatures' 'CPU temperature' 'OK' $txt }
+        } elseif ($hasLib) {
+            Add-Result 'Temperatures' 'CPU temperature' 'Info' 'Not available: reading the CPU sensor needs the free PawnIO driver.' "Install PawnIO from $($script:PawnIoUrl), then scan again to see CPU temperature and fan speeds."
+        } else {
+            Add-Result 'Temperatures' 'CPU temperature' 'Skipped' 'This PC does not expose CPU temperature to Windows.' 'Use the release zip from GitHub (it includes a sensor library), or HWiNFO, for exact temperatures.'
+        }
+    }
+
+    # GPU (one row per graphics card)
+    foreach ($g in @($readings | Where-Object { $_.Kind -eq 'Temperature' -and $_.Type -like 'Gpu*' } | Group-Object Hardware)) {
+        $core = @($g.Group | Where-Object { $_.Sensor -match 'Core' -and $_.Sensor -notmatch 'Hot ?Spot|Memory' })
+        if ($core.Count -eq 0) { $core = @($g.Group) }
+        $t = ($core | Measure-Object -Property Value -Maximum).Maximum
+        $txt = "$($g.Name): $t C."
+        if ($t -ge $T.GpuTempCritC) { Add-Result 'Temperatures' "GPU temperature: $($g.Name)" 'Critical' $txt 'Clean the graphics card fans and heatsink; check case airflow.' }
+        elseif ($t -ge $T.GpuTempWarnC) { Add-Result 'Temperatures' "GPU temperature: $($g.Name)" 'Warning' $txt 'Check the graphics card fans and case airflow.' }
+        else { Add-Result 'Temperatures' "GPU temperature: $($g.Name)" 'OK' $txt }
+    }
+
+    # Fans. 0 RPM alone is normal (unused headers, fans that stop when cool), so it
+    # is only a problem when every fan reads 0 while the CPU is hot.
+    $fans = @($readings | Where-Object { $_.Kind -eq 'Fan' })
+    if ($fans.Count -gt 0) {
+        $list = ($fans | ForEach-Object { "$($_.Sensor) $([int]$_.Value) RPM" }) -join ', '
+        $cpuHot = @($main | Where-Object { $_.Value -ge $T.ThermalWarnC }).Count -gt 0
+        if ($cpuHot -and @($fans | Where-Object { $_.Value -gt 0 }).Count -eq 0) {
+            Add-Result 'Temperatures' 'Fans' 'Critical' "All fans report 0 RPM while the CPU is hot: $list." 'Check that the CPU and case fans are connected and spinning.'
+        } else { Add-Result 'Temperatures' 'Fans' 'OK' $list }
+    }
 }
 
 function Test-Memory {
@@ -331,6 +642,7 @@ function Test-Storage {
                     $sev = 'OK'; $fix = ''
                     if ($null -ne $rc.Wear) {
                         $bits += "wear $($rc.Wear)%"
+                        Add-Metric "Wear: $($d.FriendlyName)" $rc.Wear '%' -HigherIsWorse
                         if ($rc.Wear -ge $T.DiskWearCritPct) { $sev = 'Critical'; $fix = 'SSD is near end of life - back up and replace.' }
                         elseif ($rc.Wear -ge $T.DiskWearWarnPct -and $sev -ne 'Critical') { $sev = 'Warning'; $fix = 'SSD is wearing out - plan a replacement.' }
                     }
@@ -373,8 +685,9 @@ function Test-Storage {
         $pct = [math]::Round($v.FreeSpace / $v.Size * 100, 1)
         $txt = "$($v.DeviceID) $(Format-GB $v.FreeSpace) free of $(Format-GB $v.Size) ($pct%)."
         $fix = 'Run Disk Cleanup (cleanmgr), empty the Recycle Bin, uninstall unused programs, or move files to another drive.'
-        if ($pct -lt $T.DiskFreeCritPct -or $v.FreeSpace -lt ($T.DiskFreeCritGB * 1GB)) { Add-Result 'Storage' "Free space $($v.DeviceID)" 'Critical' $txt $fix }
-        elseif ($pct -lt $T.DiskFreeWarnPct) { Add-Result 'Storage' "Free space $($v.DeviceID)" 'Warning' $txt $fix }
+        Add-Metric "Free space $($v.DeviceID)" ($v.FreeSpace / 1GB) 'GB'
+        if ($pct -lt $T.DiskFreeCritPct -or $v.FreeSpace -lt ($T.DiskFreeCritGB * 1GB)) { Add-Result 'Storage' "Free space $($v.DeviceID)" 'Critical' $txt $fix -FixId cleanmgr -FixArg $v.DeviceID }
+        elseif ($pct -lt $T.DiskFreeWarnPct) { Add-Result 'Storage' "Free space $($v.DeviceID)" 'Warning' $txt $fix -FixId cleanmgr -FixArg $v.DeviceID }
         else { Add-Result 'Storage' "Free space $($v.DeviceID)" 'OK' $txt }
     }
 
@@ -382,7 +695,7 @@ function Test-Storage {
     if ($script:IsAdmin) {
         foreach ($wv in @(Get-Cim Win32_Volume -Filter 'DriveType=3')) {
             if ($wv.DirtyBitSet -and $wv.DriveLetter) {
-                Add-Result 'Storage' "File system $($wv.DriveLetter)" 'Warning' "Volume $($wv.DriveLetter) is marked dirty (file system errors suspected)." "Run: chkdsk $($wv.DriveLetter) /f  (may need a restart)."
+                Add-Result 'Storage' "File system $($wv.DriveLetter)" 'Warning' "Volume $($wv.DriveLetter) is marked dirty (file system errors suspected)." "Run: chkdsk $($wv.DriveLetter) /f  (may need a restart)." -FixId chkdsk -FixArg $wv.DriveLetter
             }
         }
     }
@@ -390,6 +703,7 @@ function Test-Storage {
     # Disk errors in the System log
     $diskEv = Get-Events @{ LogName = 'System'; Id = 7, 11, 51, 52, 55, 98, 129, 153, 157; Level = 1, 2, 3 } 300
     $diskEv = @($diskEv | Where-Object { $_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs|stornvme|storahci|iaStor\w*|nvme\w*|volmgr)$' })
+    Add-Metric "Disk errors (last $Days days)" $diskEv.Count -HigherIsWorse -PerWindow
     if ($diskEv.Count -gt 0) {
         $groups = ($diskEv | Group-Object Id | ForEach-Object { "ID $($_.Name) x$($_.Count)" }) -join ', '
         $sev = if (@($diskEv | Where-Object { $_.Id -in 7, 11, 55 }).Count -gt 0) { 'Critical' } else { 'Warning' }
@@ -405,11 +719,11 @@ function Test-Gpu {
         $vram = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { ", $(Format-GB ([uint32]$g.AdapterRAM))+ VRAM" } else { '' }
         $txt = "$($g.Name)$vram, driver $($g.DriverVersion)$(if ($drvDate) { ' (' + $drvDate.ToString('yyyy-MM-dd') + ')' })"
         if ($g.ConfigManagerErrorCode -ne 0 -or $g.Status -ne 'OK') {
-            Add-Result 'Graphics' "GPU: $($g.Name)" 'Critical' "$txt - device error code $($g.ConfigManagerErrorCode), status $($g.Status)." 'Reinstall the graphics driver from the GPU maker (NVIDIA / AMD / Intel).'
+            Add-Result 'Graphics' "GPU: $($g.Name)" 'Critical' "$txt - device error code $($g.ConfigManagerErrorCode), status $($g.Status)." 'Reinstall the graphics driver from the GPU maker (NVIDIA / AMD / Intel).' -FixId open-devmgr
         } elseif ($g.Name -match 'Basic Display|Basic Render') {
-            Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - Windows is using the generic display driver." 'Install the proper graphics driver from your GPU or PC maker.'
+            Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - Windows is using the generic display driver." 'Install the proper graphics driver from your GPU or PC maker.' -FixId open-update
         } elseif ($null -ne $age -and $age -gt $T.DriverOldYears) {
-            Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - driver is $age years old." 'Update the graphics driver.'
+            Add-Result 'Graphics' "GPU: $($g.Name)" 'Warning' "$txt - driver is $age years old." 'Update the graphics driver.' -FixId open-update
         } else { Add-Result 'Graphics' "GPU: $($g.Name)" 'OK' $txt }
     }
 
@@ -434,6 +748,7 @@ function Test-Battery {
             if ($dc -gt 0) {
                 $wear = [math]::Round((1 - $fc / $dc) * 100)
                 if ($wear -lt 0) { $wear = 0 }
+                Add-Metric 'Battery wear' $wear '%' -HigherIsWorse -MinChange 2
                 $txt = "Holds $fc of $dc mWh design capacity ($wear% worn)."
                 if ($wear -ge $T.BatteryWearCritPct) { Add-Result 'Power' 'Battery wear' 'Critical' $txt 'Replace the battery.' }
                 elseif ($wear -ge $T.BatteryWearWarnPct) { Add-Result 'Power' 'Battery wear' 'Warning' $txt 'Battery is aging; expect shorter runtime.' }
@@ -460,24 +775,26 @@ function Test-Devices {
         $why = if ($codes.ContainsKey($c)) { $codes[$c] } else { 'error' }
         $name = if ($d.Name) { $d.Name } else { $d.DeviceID }
         $sev = if ($c -in 28, 1) { 'Warning' } else { 'Critical' }
-        Add-Result 'Devices' "Device: $name" $sev "Code $c - $why." 'Open Device Manager, right-click the device > Update driver, or download the driver from the maker.'
+        Add-Result 'Devices' "Device: $name" $sev "Code $c - $why." 'Open Device Manager, right-click the device > Update driver, or download the driver from the maker.' -FixId open-devmgr
     }
 }
 
 function Test-HardwareErrors {
     $whea = Get-Events @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger' } 200
     $fatal = @($whea | Where-Object { $_.Level -le 2 })
+    Add-Metric "Hardware errors (last $Days days)" $whea.Count -HigherIsWorse -PerWindow
     if ($fatal.Count -gt 0) {
-        Add-Result 'Stability' 'Hardware errors (WHEA)' 'Critical' "$($fatal.Count) fatal hardware error(s) and $($whea.Count - $fatal.Count) corrected in the last $Days days. Latest: $($fatal[0].TimeCreated.ToString('yyyy-MM-dd HH:mm'))." 'Usually CPU, RAM, PCIe or overclock instability. Remove overclocks/XMP, test RAM (mdsched), update BIOS.'
+        Add-Result 'Stability' 'Hardware errors (WHEA)' 'Critical' "$($fatal.Count) fatal hardware error(s) and $($whea.Count - $fatal.Count) corrected in the last $Days days. Latest: $($fatal[0].TimeCreated.ToString('yyyy-MM-dd HH:mm'))." 'Usually CPU, RAM, PCIe or overclock instability. Remove overclocks/XMP, test RAM (mdsched), update BIOS.' -FixId memory-test
     } elseif ($whea.Count -gt 20) {
         Add-Result 'Stability' 'Hardware errors (WHEA)' 'Warning' "$($whea.Count) corrected hardware errors in the last $Days days." 'Often a PCIe link issue; update chipset drivers and BIOS.'
     } else { Add-Result 'Stability' 'Hardware errors (WHEA)' 'OK' "$($whea.Count) corrected / 0 fatal hardware errors." }
 
     $bsod = Get-Events @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001 } 50
     $power = Get-Events @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41 } 50
+    Add-Metric "Blue screens (last $Days days)" $bsod.Count -HigherIsWorse -PerWindow
     if ($bsod.Count -gt 0) {
         $codes = ($bsod | ForEach-Object { if ($_.Message -match '0x[0-9a-fA-F]{8}') { $Matches[0] } } | Select-Object -Unique) -join ', '
-        Add-Result 'Stability' 'Blue screens' 'Critical' "$($bsod.Count) blue screen crash(es) in the last $Days days. Bug check codes: $codes." 'Look up the code; common causes are drivers, RAM and overheating. Dumps are in C:\Windows\Minidump.'
+        Add-Result 'Stability' 'Blue screens' 'Critical' "$($bsod.Count) blue screen crash(es) in the last $Days days. Bug check codes: $codes." 'Look up the code; common causes are drivers, RAM and overheating. Dumps are in C:\Windows\Minidump.' -FixId memory-test
     } else { Add-Result 'Stability' 'Blue screens' 'OK' "No blue screens in the last $Days days." }
     if ($power.Count -gt 0) {
         Add-Result 'Stability' 'Unexpected shutdowns' 'Warning' "$($power.Count) unexpected power loss / hard reset(s) in the last $Days days." 'Check the power supply, cables and temperatures; also logged after holding the power button.'
@@ -505,7 +822,7 @@ function Test-WindowsUpdate {
         if ($pfro) { $pending += 'File rename operations' }
     } catch {}
     if ($pending.Count -gt 0) {
-        Add-Result 'Updates' 'Pending restart' 'Warning' "A restart is pending ($($pending -join ', '))." 'Restart the PC to finish installing updates.'
+        Add-Result 'Updates' 'Pending restart' 'Warning' "A restart is pending ($($pending -join ', '))." 'Restart the PC to finish installing updates.' -FixId restart
     } else { Add-Result 'Updates' 'Pending restart' 'OK' 'No restart pending.' }
 
     $hf = @(Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending)
@@ -513,19 +830,19 @@ function Test-WindowsUpdate {
         $last = $hf[0].InstalledOn
         $age = [math]::Round(((Get-Date) - $last).TotalDays)
         $txt = "Last update installed $($last.ToString('yyyy-MM-dd')) ($age days ago, $($hf[0].HotFixID))."
-        if ($age -ge $T.UpdateCritDays) { Add-Result 'Updates' 'Windows Update' 'Critical' $txt 'Open Settings > Windows Update and install updates.' }
-        elseif ($age -ge $T.UpdateWarnDays) { Add-Result 'Updates' 'Windows Update' 'Warning' $txt 'Open Settings > Windows Update and check for updates.' }
+        if ($age -ge $T.UpdateCritDays) { Add-Result 'Updates' 'Windows Update' 'Critical' $txt 'Open Settings > Windows Update and install updates.' -FixId open-update }
+        elseif ($age -ge $T.UpdateWarnDays) { Add-Result 'Updates' 'Windows Update' 'Warning' $txt 'Open Settings > Windows Update and check for updates.' -FixId open-update }
         else { Add-Result 'Updates' 'Windows Update' 'OK' $txt }
     }
 
     $wuFail = Get-Events @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20 } 50
     if ($wuFail.Count -gt 0) {
-        Add-Result 'Updates' 'Failed updates' 'Warning' "$($wuFail.Count) update installation failure(s) in the last $Days days." 'Run the Windows Update troubleshooter (Settings > System > Troubleshoot).'
+        Add-Result 'Updates' 'Failed updates' 'Warning' "$($wuFail.Count) update installation failure(s) in the last $Days days." 'Run the Windows Update troubleshooter (Settings > System > Troubleshoot).' -FixId open-update
     }
 
     $wu = Get-Service wuauserv -ErrorAction SilentlyContinue
     if ($wu -and $wu.StartType -eq 'Disabled') {
-        Add-Result 'Updates' 'Update service' 'Critical' 'The Windows Update service is disabled.' 'Set "Windows Update" service to Manual in services.msc.'
+        Add-Result 'Updates' 'Update service' 'Critical' 'The Windows Update service is disabled.' 'Set "Windows Update" service to Manual in services.msc.' -FixId wu-service
     }
 }
 
@@ -541,21 +858,21 @@ function Test-Security {
         $on = @($other | Where-Object { ([int64]$_.productState -band 0x1000) -ne 0 })
         $stale = @($on | Where-Object { ([int64]$_.productState -band 0x10) -ne 0 })
         if ($stale.Count -gt 0) {
-            Add-Result 'Security' 'Antivirus' 'Warning' "Third-party antivirus is on but its signatures are out of date: $(($stale.displayName) -join ', ')." 'Open the antivirus program and update it, or renew its subscription.'
+            Add-Result 'Security' 'Antivirus' 'Warning' "Third-party antivirus is on but its signatures are out of date: $(($stale.displayName) -join ', ')." 'Open the antivirus program and update it, or renew its subscription.' -FixId open-security
         } elseif ($on.Count -gt 0) {
             Add-Result 'Security' 'Antivirus' 'OK' "Third-party antivirus active: $(($on.displayName) -join ', ')."
         } elseif (-not $mp) {
             $offNote = if ($other.Count -gt 0) { " ($(($other.displayName) -join ', ') is installed but turned off)" } else { '' }
-            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender could not be queried (its service may be stopped) and no active antivirus was found$offNote." 'Open Windows Security > Virus & threat protection and turn protection on, or re-enable your antivirus.'
+            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender could not be queried (its service may be stopped) and no active antivirus was found$offNote." 'Open Windows Security > Virus & threat protection and turn protection on, or re-enable your antivirus.' -FixId open-security
         } else {
             $offNote = if ($other.Count -gt 0) { " ($(($other.displayName) -join ', ') is installed but turned off)" } else { '' }
-            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender real-time protection is off and no other active antivirus was found$offNote." 'Turn on real-time protection in Windows Security.'
+            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender real-time protection is off and no other active antivirus was found$offNote." 'Turn on real-time protection in Windows Security.' -FixId defender-on
         }
     } else {
         $sigAge = [math]::Round(((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalDays, 1)
         $txt = "Microsoft Defender on. Signatures $sigAge day(s) old."
-        if ($sigAge -ge $T.DefSigCritDays) { Add-Result 'Security' 'Antivirus' 'Critical' $txt 'Update signatures: Windows Security > Virus protection > Check for updates.' }
-        elseif ($sigAge -ge $T.DefSigWarnDays) { Add-Result 'Security' 'Antivirus' 'Warning' $txt 'Update antivirus signatures.' }
+        if ($sigAge -ge $T.DefSigCritDays) { Add-Result 'Security' 'Antivirus' 'Critical' $txt 'Update signatures: Windows Security > Virus protection > Check for updates.' -FixId defender-update }
+        elseif ($sigAge -ge $T.DefSigWarnDays) { Add-Result 'Security' 'Antivirus' 'Warning' $txt 'Update antivirus signatures.' -FixId defender-update }
         else { Add-Result 'Security' 'Antivirus' 'OK' $txt }
     }
     if ($mp) {
@@ -564,7 +881,7 @@ function Test-Security {
         if ($threats.Count -gt 0) {
             $active = @($threats | Where-Object { $_.ThreatStatusID -notin 2, 3, 4, 5, 6 })   # not removed/quarantined/allowed
             $sev = if ($active.Count -gt 0) { 'Critical' } else { 'Warning' }
-            Add-Result 'Security' 'Malware detections' $sev "$($threats.Count) threat detection(s) in the last $Days days, $($active.Count) not yet resolved." 'Open Windows Security > Protection history and run a full scan.'
+            Add-Result 'Security' 'Malware detections' $sev "$($threats.Count) threat detection(s) in the last $Days days, $($active.Count) not yet resolved." 'Open Windows Security > Protection history and run a full scan.' -FixId open-security
         } else { Add-Result 'Security' 'Malware detections' 'OK' "No threats detected in the last $Days days." }
     }
 
@@ -572,7 +889,7 @@ function Test-Security {
     try {
         $off = @(Get-NetFirewallProfile -ErrorAction Stop | Where-Object { -not $_.Enabled })
         if ($off.Count -gt 0) {
-            Add-Result 'Security' 'Firewall' 'Critical' "Firewall is OFF for profile(s): $(($off.Name) -join ', ')." 'Turn the firewall on in Windows Security > Firewall & network protection.'
+            Add-Result 'Security' 'Firewall' 'Critical' "Firewall is OFF for profile(s): $(($off.Name) -join ', ')." 'Turn the firewall on in Windows Security > Firewall & network protection.' -FixId firewall-on
         } else { Add-Result 'Security' 'Firewall' 'OK' 'Firewall enabled for all profiles.' }
     } catch { Add-Result 'Security' 'Firewall' 'Error' 'Could not read firewall state.' }
 
@@ -621,7 +938,7 @@ function Test-SystemFiles {
     if ($out -match 'No component store corruption detected') {
         Add-Result 'OS Health' 'Component store (DISM)' 'OK' 'No Windows component corruption detected.'
     } elseif ($out -match 'repairable') {
-        Add-Result 'OS Health' 'Component store (DISM)' 'Critical' 'Windows system files are flagged as corrupted (repairable).' 'Run as admin: DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow'
+        Add-Result 'OS Health' 'Component store (DISM)' 'Critical' 'Windows system files are flagged as corrupted (repairable).' 'Run as admin: DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow' -FixId repair-system
     } else {
         $tail = ($out -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 2) -join ' '
         Add-Result 'OS Health' 'Component store (DISM)' 'Warning' "DISM result unclear: $tail"
@@ -632,7 +949,7 @@ function Test-SystemFiles {
     if (Test-Path $cbs) {
         $hit = Select-String -Path $cbs -Pattern 'found corrupt files and (was unable|successfully)' -ErrorAction SilentlyContinue | Select-Object -Last 1
         if ($hit -and $hit.Line -match 'unable') {
-            Add-Result 'OS Health' 'Last SFC scan' 'Critical' 'The last sfc /scannow found corrupt files it could not fix.' 'Run DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow again.'
+            Add-Result 'OS Health' 'Last SFC scan' 'Critical' 'The last sfc /scannow found corrupt files it could not fix.' 'Run DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow again.' -FixId repair-system
         }
     }
 }
@@ -652,7 +969,7 @@ function Test-Services {
     $critical = 'EventLog|Winmgmt|RpcSs|Dhcp|Dnscache|LanmanWorkstation|mpssvc|WinDefend|CryptSvc|Audiosrv|AudioEndpointBuilder|Schedule|Themes|nsi|BFE|ProfSvc|Power|PlugPlay'
     foreach ($s in $svc) {
         $sev = if ($s.Name -match "^($critical)$") { 'Critical' } else { 'Warning' }
-        Add-Result 'Services' "Service stopped: $($s.DisplayName)" $sev "Set to start automatically but is $($s.State) (exit code $($s.ExitCode))." "Try: Start-Service $($s.Name)  or restart the PC."
+        Add-Result 'Services' "Service stopped: $($s.DisplayName)" $sev "Set to start automatically but is $($s.State) (exit code $($s.ExitCode))." "Try: Start-Service $($s.Name)  or restart the PC." -FixId start-service -FixArg $s.Name
     }
     if ($svc.Count -eq 0) { Add-Result 'Services' 'Automatic services' 'OK' 'All automatic services are running.' }
 
@@ -668,6 +985,7 @@ function Test-AppCrashes {
     $crashes = Get-Events @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000 } 500
     $hangs = Get-Events @{ LogName = 'Application'; ProviderName = 'Application Hang'; Id = 1002 } 500
     $all = @($crashes) + @($hangs)
+    Add-Metric "Program crashes and hangs (last $Days days)" $all.Count -HigherIsWorse -PerWindow
     if ($all.Count -eq 0) { Add-Result 'Applications' 'Program crashes' 'OK' "No program crashes in the last $Days days."; return }
     $byApp = $all | ForEach-Object { if ($_.Properties.Count -gt 0) { [string]$_.Properties[0].Value } } |
              Group-Object | Sort-Object Count -Descending | Select-Object -First 8
@@ -693,8 +1011,9 @@ function Test-Startup {
     }
     $enabled = @($items | Where-Object { -not $disabled.ContainsKey($_.Name) -and -not $disabled.ContainsKey("$($_.Name).lnk") })
     $names = ($enabled | Select-Object -ExpandProperty Name -Unique) -join ', '
+    Add-Metric 'Startup programs' $enabled.Count -HigherIsWorse
     if ($enabled.Count -ge $T.StartupItemsWarn) {
-        Add-Result 'Applications' 'Startup programs' 'Warning' "$($enabled.Count) programs start with Windows: $names." 'Disable ones you do not need in Task Manager > Startup apps.'
+        Add-Result 'Applications' 'Startup programs' 'Warning' "$($enabled.Count) programs start with Windows: $names." 'Disable ones you do not need in Task Manager > Startup apps.' -FixId open-startup
     } else { Add-Result 'Applications' 'Startup programs' 'OK' "$($enabled.Count) startup program(s): $names." }
 }
 
@@ -725,7 +1044,7 @@ function Test-InstalledSoftware {
     foreach ($e in $eol) {
         $hit = @($script:InstalledApps | Where-Object { $_.Name -match $e.P })
         foreach ($h in $hit) {
-            Add-Result 'Applications' "Outdated: $($h.Name)" 'Warning' $e.W 'Uninstall it unless you specifically need it.'
+            Add-Result 'Applications' "Outdated: $($h.Name)" 'Warning' $e.W 'Uninstall it unless you specifically need it.' -FixId open-apps
         }
     }
 }
@@ -750,6 +1069,7 @@ function Test-SystemEvents {
     $errMax = [math]::Max(1000, 20 * $Days + 1)
     $crit = Get-Events @{ LogName = 'System'; Level = 1 } 200
     $err = Get-Events @{ LogName = 'System'; Level = 2 } $errMax
+    Add-Metric "System log errors (last $Days days)" $err.Count -HigherIsWorse -MinChange 10 -PerWindow
     $top = ($err | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
     $txt = "$(Format-Count $crit.Count 200) critical and $(Format-Count $err.Count $errMax) error events in the System log over $Days days. Top sources: $top."
     if ($crit.Count -gt 0) { Add-Result 'OS Health' 'System event log' 'Warning' $txt 'Open Event Viewer > Windows Logs > System for details. Specific causes are listed in other sections.' }
@@ -763,8 +1083,9 @@ function Test-Housekeeping {
     foreach ($p in @($env:TEMP, "$env:SystemRoot\Temp") | Select-Object -Unique) {
         $size += (Get-ChildItem $p -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
     }
+    Add-Metric 'Temporary files' ($size / 1GB) 'GB' -HigherIsWorse
     if ($size -ge ($T.TempFolderWarnGB * 1GB)) {
-        Add-Result 'OS Health' 'Temporary files' 'Warning' "$(Format-GB $size) in temp folders." 'Settings > System > Storage > Temporary files, or run cleanmgr.'
+        Add-Result 'OS Health' 'Temporary files' 'Warning' "$(Format-GB $size) in temp folders." 'Settings > System > Storage > Temporary files, or run cleanmgr.' -FixId cleanmgr -FixArg $env:SystemDrive
     } else { Add-Result 'OS Health' 'Temporary files' 'OK' "$(Format-GB $size) in temp folders." }
 
     # Page file
@@ -785,12 +1106,12 @@ function Test-Housekeeping {
         $w32 = (Invoke-Native 'w32tm.exe' @('/query', '/status')) -join "`n"
         # On home PCs the service is trigger-started and is often stopped between syncs; only Disabled is a fault.
         if ($w32svc -and $w32svc.StartType -eq 'Disabled') {
-            Add-Result 'OS Health' 'Clock sync' 'Warning' 'Windows Time service is disabled; the clock may drift and break HTTPS/logins.' 'Set the "Windows Time" service to Manual in services.msc, then sync in Settings > Time & language.'
+            Add-Result 'OS Health' 'Clock sync' 'Warning' 'Windows Time service is disabled; the clock may drift and break HTTPS/logins.' 'Set the "Windows Time" service to Manual in services.msc, then sync in Settings > Time & language.' -FixId time-sync
         } elseif ($w32 -match 'Last Successful Sync Time:\s*(.+)') {
             $ls = $Matches[1].Trim()
             $dt = [datetime]::MinValue
             if ([datetime]::TryParse($ls, [ref]$dt) -and ((Get-Date) - $dt).TotalDays -gt 14) {
-                Add-Result 'OS Health' 'Clock sync' 'Warning' "Clock last synced $ls." 'Settings > Time & language > Sync now.'
+                Add-Result 'OS Health' 'Clock sync' 'Warning' "Clock last synced $ls." 'Settings > Time & language > Sync now.' -FixId time-sync
             } else { Add-Result 'OS Health' 'Clock sync' 'OK' "Last time sync: $ls." }
         }
     } catch {}
@@ -801,7 +1122,7 @@ function Test-Housekeeping {
         if ($plan -match '\((.+)\)') {
             $name = $Matches[1]
             # Match the built-in Power saver plan by its GUID; plan names are translated
-            if ($plan -match 'a1841308-3541-4fab-bc81-f71556f20b4a') { Add-Result 'Power' 'Power plan' 'Info' "Active plan: $name - performance is reduced." 'Switch to Balanced if the PC feels slow.' }
+            if ($plan -match 'a1841308-3541-4fab-bc81-f71556f20b4a') { Add-Result 'Power' 'Power plan' 'Info' "Active plan: $name - performance is reduced." 'Switch to Balanced if the PC feels slow.' -FixId power-balanced }
             else { Add-Result 'Power' 'Power plan' 'OK' "Active plan: $name." }
         }
     } catch {}
@@ -819,7 +1140,7 @@ function Test-Network {
     $upIdx = @($up | Select-Object -ExpandProperty InterfaceIndex)
     $apipa = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like '169.254.*' -and $_.InterfaceIndex -in $upIdx })
     if ($apipa.Count -gt 0) {
-        Add-Result 'Network' 'IP address' 'Warning' "Adapter(s) have no DHCP address (169.254.x.x): $(($apipa.InterfaceAlias) -join ', ')." 'Restart the router, or run: ipconfig /release && ipconfig /renew'
+        Add-Result 'Network' 'IP address' 'Warning' "Adapter(s) have no DHCP address (169.254.x.x): $(($apipa.InterfaceAlias) -join ', ')." 'Restart the router, or run: ipconfig /release && ipconfig /renew' -FixId renew-ip
     }
 
     if ($Quick) { Add-Result 'Network' 'Internet connectivity' 'Skipped' 'Skipped in -Quick mode.'; return }
@@ -846,7 +1167,7 @@ function Test-Network {
         $null = Resolve-DnsName 'www.microsoft.com' -ErrorAction Stop -QuickTimeout
         Add-Result 'Network' 'DNS' 'OK' 'Name resolution works.'
     } catch {
-        Add-Result 'Network' 'DNS' 'Critical' 'Cannot resolve internet names.' 'Run: ipconfig /flushdns, or set DNS to 1.1.1.1 / 8.8.8.8.'
+        Add-Result 'Network' 'DNS' 'Critical' 'Cannot resolve internet names.' 'Run: ipconfig /flushdns, or set DNS to 1.1.1.1 / 8.8.8.8.' -FixId flush-dns
     }
 
     # Proxy / hosts file tampering
@@ -859,148 +1180,732 @@ function Test-Network {
     }
 }
 
+
+# ===========================================================================
+# COMPARISON WITH THE PREVIOUS SCAN
+# ===========================================================================
+function Get-PreviousData {
+    param([string]$Dir, [string]$ExcludePath)
+    $files = @(Get-ChildItem -Path $Dir -Filter "Diagnostic_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
+               Where-Object { $_.FullName -ne $ExcludePath } | Sort-Object LastWriteTime -Descending)
+    foreach ($f in $files) {
+        try { return (Get-Content $f.FullName -Raw | ConvertFrom-Json) } catch {}
+    }
+    $null
+}
+
+function Compare-Runs {
+    param($Prev, $Curr)
+    $rank = @{ OK = 0; Info = 0; Skipped = 0; Error = 1; Warning = 1; Critical = 2 }
+    $worse = New-Object System.Collections.Generic.List[string]
+    $better = New-Object System.Collections.Generic.List[string]
+    $newCritical = New-Object System.Collections.Generic.List[string]
+
+    $prevMap = @{}
+    foreach ($r in @($Prev.Results)) { if ($r) { $prevMap["$($r.Category)|$($r.Check)"] = $r } }
+    $currKeys = @{}
+    foreach ($r in @($Curr.Results)) {
+        $k = "$($r.Category)|$($r.Check)"
+        $currKeys[$k] = $true
+        $now = $rank[[string]$r.Status]
+        if ($prevMap.ContainsKey($k)) {
+            $p = $prevMap[$k]
+            $was = $rank[[string]$p.Status]
+            if ($now -gt $was) { $worse.Add("$($r.Check): $($p.Status) -> $($r.Status)") }
+            elseif ($now -lt $was) { $better.Add("$($r.Check): $($p.Status) -> $($r.Status)") }
+            if ($r.Status -eq 'Critical' -and $p.Status -ne 'Critical') { $newCritical.Add($r.Check) }
+        } elseif ($now -gt 0) {
+            $worse.Add("$($r.Check): new $($r.Status)")
+            if ($r.Status -eq 'Critical') { $newCritical.Add($r.Check) }
+        }
+    }
+    # A problem row disappears when it is fixed (e.g. a stopped service runs again).
+    # Only trust that when both scans ran the same way (quick mode / admin rights).
+    $sameMode = ((Get-Prop $Prev 'Quick') -eq (Get-Prop $Curr 'Quick')) -and ((Get-Prop $Prev 'IsAdmin') -eq (Get-Prop $Curr 'IsAdmin'))
+    if ($sameMode) {
+        foreach ($k in @($prevMap.Keys)) {
+            $p = $prevMap[$k]
+            if (-not $currKeys.ContainsKey($k) -and $p.Status -in 'Warning', 'Critical') {
+                $better.Add("$($p.Check): no longer reported (was $($p.Status))")
+            }
+        }
+    }
+
+    $pm = @{}
+    foreach ($m in @(Get-Prop $Prev 'Metrics' @())) { if ($m) { $pm[[string]$m.Name] = $m } }
+    foreach ($m in @($Curr.Metrics)) {
+        if (-not $pm.ContainsKey([string]$m.Name)) { continue }
+        if ($m.PerWindow -and (Get-Prop $Prev 'Days') -ne (Get-Prop $Curr 'Days')) { continue }
+        $old = [double]$pm[[string]$m.Name].Value
+        $new = [double]$m.Value
+        $d = $new - $old
+        if ([math]::Abs($d) -lt [double]$m.MinChange) { continue }
+        $unit = if ($m.Unit -eq '%') { '%' } elseif ($m.Unit) { " $($m.Unit)" } else { '' }
+        $sign = if ($d -gt 0) { '+' } else { '' }
+        $txt = '{0}: {1}{3} -> {2}{3} ({4}{5}{3})' -f $m.Name, $old, $new, $unit, $sign, [math]::Round($d, 1)
+        if (($d -gt 0) -eq [bool]$m.HigherIsWorse) { $worse.Add($txt) } else { $better.Add($txt) }
+    }
+
+    [pscustomobject]@{
+        Since       = Get-Prop $Prev 'Generated' '?'
+        Worse       = $worse.ToArray()
+        Better      = $better.ToArray()
+        NewCritical = $newCritical.ToArray()
+    }
+}
+
 # ===========================================================================
 # REPORT
 # ===========================================================================
-function ConvertTo-Html-Safe { param([string]$s) [System.Net.WebUtility]::HtmlEncode($s) }
+function Get-Overall {
+    param($Counts)
+    if ($Counts.Critical -gt 0) { 'Critical' } elseif ($Counts.Warning -gt 0 -or $Counts.Error -gt 0) { 'Warning' } else { 'OK' }
+}
+
+function Get-Headline {
+    param([string]$Overall, $Counts)
+    if ($Overall -eq 'Critical') { return "$($Counts.Critical) serious problem(s) need attention" }
+    if ($Overall -eq 'Warning') {
+        if ($Counts.Warning -gt 0) { return "$($Counts.Warning) issue(s) worth looking at" }
+        return "$($Counts.Error) check(s) could not run"
+    }
+    'No problems found'
+}
+
+# Hides the PC name, user name and profile path, for the shareable report.
+function Protect-Text {
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $pairs = @(, @($env:USERPROFILE, '%USERPROFILE%'))
+    $pairs += , @($env:COMPUTERNAME, 'THIS-PC')
+    if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) { $pairs += , @($env:USERDOMAIN, 'DOMAIN') }
+    if ($env:USERNAME -and $env:USERNAME.Length -ge 3) { $pairs += , @($env:USERNAME, 'user') }
+    foreach ($p in $pairs) {
+        if ($p[0]) {
+            $pattern = '(?<![A-Za-z0-9])' + [regex]::Escape($p[0]) + '(?![A-Za-z0-9])'
+            $Text = [regex]::Replace($Text, $pattern, $p[1], 'IgnoreCase')
+        }
+    }
+    $Text
+}
 
 function Write-Report {
-    param([string]$Dir)
-    if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Path $Dir | Out-Null }
-    $stamp = Get-Date -Format 'yyyy-MM-dd_HHmm'
-    $base = Join-Path $Dir "Diagnostic_$($env:COMPUTERNAME)_$stamp"
-
+    param($Data, [string]$Path, [switch]$Redact)
     $order = @{ Critical = 0; Error = 1; Warning = 2; Info = 3; Skipped = 4; OK = 5 }
-    $counts = @{}
-    foreach ($s in $order.Keys) { $counts[$s] = @($script:Results | Where-Object Status -eq $s).Count }
-    # A check that could not run is not a clean result, so it raises the overall status to Warning
-    $overall = if ($counts.Critical -gt 0) { 'Critical' } elseif ($counts.Warning -gt 0 -or $counts.Error -gt 0) { 'Warning' } else { 'OK' }
-    $headline = switch ($overall) {
-        'Critical' { "$($counts.Critical) serious problem(s) need attention" }
-        'Warning'  { if ($counts.Warning -gt 0) { "$($counts.Warning) issue(s) worth looking at" } else { "$($counts.Error) check(s) could not run" } }
-        default    { 'No problems found' }
-    }
+    if ($Redact) { $e = { param($x) [System.Net.WebUtility]::HtmlEncode((Protect-Text ([string]$x))) } }
+    else { $e = { param($x) [System.Net.WebUtility]::HtmlEncode([string]$x) } }
 
-    # JSON
-    [pscustomobject]@{
-        Generated = (Get-Date).ToString('o')
-        Overall   = $overall
-        Counts    = $counts
-        Overview  = $script:Overview
-        Results   = $script:Results
-        Installed = $script:InstalledApps
-    } | ConvertTo-Json -Depth 5 | Set-Content -Path "$base.json" -Encoding UTF8
+    $results = @($Data.Results | Where-Object { $_ })
+    $counts = $Data.Counts
+    $overall = [string]$Data.Overall
+    $headline = Get-Headline $overall $counts
 
-    $e = { param($x) ConvertTo-Html-Safe ([string]$x) }
-
-    $issues = $script:Results | Where-Object { $_.Status -in 'Critical', 'Warning', 'Error' } |
-              Sort-Object @{ e = { $order[$_.Status] } }, Category
-    $issueHtml = if (@($issues).Count -eq 0) { '<p class="none">Nothing needs fixing. Nice.</p>' } else {
-        ($issues | ForEach-Object {
-            "<div class='issue $($_.Status.ToLower())'><div class='ih'><span class='badge $($_.Status.ToLower())'>$($_.Status)</span><b>$(& $e $_.Check)</b><span class='cat'>$(& $e $_.Category)</span></div><div>$(& $e $_.Detail)</div>$(if ($_.Fix) { "<div class='fix'><b>What to do:</b> $(& $e $_.Fix)</div>" })</div>"
+    # Issues
+    $issues = @($results | Where-Object { $_.Status -in 'Critical', 'Warning', 'Error' } |
+                Sort-Object @{ e = { $order[[string]$_.Status] } }, Category)
+    if ($issues.Count -eq 0) { $issueHtml = '<p class="none">Nothing needs fixing. Nice.</p>' }
+    else {
+        $issueHtml = ($issues | ForEach-Object {
+            $st = ([string]$_.Status).ToLower()
+            $fid = [string](Get-Prop $_ 'FixId' '')
+            $oneClick = ''
+            if ($fid -and $script:FixActions.Contains($fid)) {
+                $title = $script:FixActions[$fid].Title -f [string](Get-Prop $_ 'FixArg' '')
+                $oneClick = "<div class='fix'><b>One-click fix:</b> $(& $e $title) <span class='mut'>(in the Diagnostic-kun window)</span></div>"
+            }
+            $what = if ($_.Fix) { "<div class='fix'><b>What to do:</b> $(& $e $_.Fix)</div>" } else { '' }
+            "<div class='issue $st'><div class='ih'><span class='badge $st'>$($_.Status)</span><b>$(& $e $_.Check)</b><span class='cat'>$(& $e $_.Category)</span></div><div>$(& $e $_.Detail)</div>$what$oneClick</div>"
         }) -join "`n"
     }
 
-    $catHtml = ($script:Results | Group-Object Category | ForEach-Object {
-        $rows = ($_.Group | Sort-Object @{ e = { $order[$_.Status] } } | ForEach-Object {
-            "<tr><td><span class='badge $($_.Status.ToLower())'>$($_.Status)</span></td><td>$(& $e $_.Check)</td><td>$(& $e $_.Detail)$(if ($_.Fix -and $_.Status -notin 'OK') { "<div class='fix'>$(& $e $_.Fix)</div>" })</td></tr>"
+    # Changes since the last scan
+    $cmp = Get-Prop $Data 'Comparison'
+    if ($cmp) {
+        $worse = @(Get-Prop $cmp 'Worse' @() | Where-Object { $_ })
+        $better = @(Get-Prop $cmp 'Better' @() | Where-Object { $_ })
+        $since = & $e (Get-Prop $cmp 'Since' '?')
+        if (($worse.Count + $better.Count) -eq 0) { $chgHtml = "<p class='none'>Nothing changed since the last scan ($since).</p>" }
+        else {
+            $chgHtml = "<p class='sub'>Compared with the scan on $since.</p><div class='chg'>"
+            if ($worse.Count -gt 0) { $chgHtml += "<div><h3 class='w'>Got worse ($($worse.Count))</h3><ul>" + (($worse | ForEach-Object { "<li>$(& $e $_)</li>" }) -join '') + '</ul></div>' }
+            if ($better.Count -gt 0) { $chgHtml += "<div><h3 class='b'>Improved ($($better.Count))</h3><ul>" + (($better | ForEach-Object { "<li>$(& $e $_)</li>" }) -join '') + '</ul></div>' }
+            $chgHtml += '</div>'
+        }
+    } else {
+        $chgHtml = "<p class='none'>This is the first saved scan of this PC. Next time, this section shows what changed.</p>"
+    }
+
+    # All checks, grouped by area
+    $catHtml = ($results | Group-Object Category | ForEach-Object {
+        $sorted = @($_.Group | Sort-Object @{ e = { $order[[string]$_.Status] } })
+        $rows = ($sorted | ForEach-Object {
+            $st = ([string]$_.Status).ToLower()
+            $fixTxt = if ($_.Fix -and $_.Status -ne 'OK') { "<div class='fix'>$(& $e $_.Fix)</div>" } else { '' }
+            "<tr><td><span class='badge $st'>$($_.Status)</span></td><td>$(& $e $_.Check)</td><td>$(& $e $_.Detail)$fixTxt</td></tr>"
         }) -join ''
-        $worst = ($_.Group | Sort-Object @{ e = { $order[$_.Status] } } | Select-Object -First 1).Status.ToLower()
-        "<details class='sec' $(if ($worst -in 'critical','warning','error') { 'open' })><summary><span class='dot $worst'></span>$(& $e $_.Name)<span class='n'>$($_.Count) checks</span></summary><table>$rows</table></details>"
+        $worst = ([string]$sorted[0].Status).ToLower()
+        $open = if ($worst -in 'critical', 'warning', 'error') { 'open' } else { '' }
+        "<details class='sec' $open><summary><span class='dot $worst'></span>$(& $e $_.Name)<span class='n'>$($_.Count) checks</span></summary><table>$rows</table></details>"
     }) -join "`n"
 
-    $ovHtml = ($script:Overview.GetEnumerator() | ForEach-Object { "<tr><th>$(& $e $_.Key)</th><td>$(& $e $_.Value)</td></tr>" }) -join ''
-    $appHtml = (@($script:InstalledApps) | ForEach-Object { "<tr><td>$(& $e $_.Name)</td><td>$(& $e $_.Version)</td><td>$(& $e $_.Publisher)</td></tr>" }) -join ''
+    # Overview (an ordered dictionary when live, an object when read back from JSON)
+    $ov = Get-Prop $Data 'Overview'
+    $ovRows = @()
+    if ($ov -is [System.Collections.IDictionary]) { foreach ($k in $ov.Keys) { $ovRows += "<tr><th>$(& $e $k)</th><td>$(& $e $ov[$k])</td></tr>" } }
+    elseif ($ov) { foreach ($p in $ov.PSObject.Properties) { $ovRows += "<tr><th>$(& $e $p.Name)</th><td>$(& $e $p.Value)</td></tr>" } }
+    $ovHtml = $ovRows -join ''
+
+    $apps = @(Get-Prop $Data 'Installed' @() | Where-Object { $_ })
+    if ($Redact) { $appSection = "<h2>Installed programs</h2><p class='sub'>Hidden in this shareable copy.</p>" }
+    else {
+        $appHtml = ($apps | ForEach-Object { "<tr><td>$(& $e $_.Name)</td><td>$(& $e $_.Version)</td><td>$(& $e $_.Publisher)</td></tr>" }) -join ''
+        $appSection = "<h2>Installed programs ($($apps.Count))</h2><details class='sec'><summary>Show list</summary><table>$appHtml</table></details>"
+    }
+
+    $computer = & $e (Get-Prop $Data 'Computer' $env:COMPUTERNAME)
+    $generated = & $e (Get-Prop $Data 'Generated' '')
+    $days = Get-Prop $Data 'Days' 7
+    $ver = & $e (Get-Prop $Data 'Version' '')
+    $adminNote = if (-not (Get-Prop $Data 'IsAdmin' $true)) { ' &middot; <b>not run as admin - some checks skipped</b>' } else { '' }
+    $shareNote = if ($Redact) { "<p class='share'>Shareable copy: the PC name, user name and installed programs are hidden.</p>" } else { '' }
+    $ovColor = @{ OK = 'ok'; Warning = 'warn'; Critical = 'crit' }[$overall]
 
     $html = @"
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PC Diagnostic - $(& $e $env:COMPUTERNAME)</title>
+<title>PC Diagnostic - $computer</title>
 <style>
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#667085;--line:#e4e7ec;--ok:#12805c;--info:#2e6fd8;--warn:#b26b00;--crit:#c4282d;--skip:#8a8f98}
 @media (prefers-color-scheme:dark){:root{--bg:#14161b;--card:#1d2027;--fg:#e8eaee;--mut:#9aa1ad;--line:#2d313a;--ok:#3cc28f;--info:#6b9ff0;--warn:#e9a23b;--crit:#f0646a;--skip:#8a8f98}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
 main{max-width:1000px;margin:0 auto;padding:24px 16px 60px}h1{margin:0 0 4px;font-size:26px}h2{margin:32px 0 12px;font-size:18px}
-.sub{color:var(--mut)}.hero{background:var(--card);border:1px solid var(--line);border-left:6px solid var(--ov);border-radius:10px;padding:18px 20px;margin:20px 0}
+.sub,.mut{color:var(--mut)}.hero{background:var(--card);border:1px solid var(--line);border-left:6px solid var(--ov);border-radius:10px;padding:18px 20px;margin:20px 0}
 .hero b{font-size:20px;color:var(--ov)}.counts{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.counts span{padding:4px 10px;border-radius:999px;background:var(--bg);font-size:13px}
 .badge{display:inline-block;min-width:68px;text-align:center;padding:1px 8px;border-radius:5px;font-size:12px;font-weight:600;color:#fff}
 .badge.ok{background:var(--ok)}.badge.info{background:var(--info)}.badge.warning{background:var(--warn)}.badge.critical,.badge.error{background:var(--crit)}.badge.skipped{background:var(--skip)}
 .issue{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--warn);border-radius:8px;padding:12px 14px;margin-bottom:10px}
 .issue.critical,.issue.error{border-left-color:var(--crit)}.ih{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px}.cat{color:var(--mut);font-size:13px;margin-left:auto}
-.fix{margin-top:6px;color:var(--mut);font-size:14px}.none{background:var(--card);padding:14px;border-radius:8px;border:1px solid var(--line)}
+.fix{margin-top:6px;color:var(--mut);font-size:14px}.none,.share{background:var(--card);padding:12px 14px;border-radius:8px;border:1px solid var(--line)}.share{border-style:dashed}
+.chg{display:grid;grid-template-columns:1fr 1fr;gap:12px}.chg>div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px}
+.chg h3{margin:0 0 6px;font-size:15px}.chg h3.w{color:var(--crit)}.chg h3.b{color:var(--ok)}.chg ul{margin:0;padding-left:18px}
 .sec{background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:8px}.sec summary{cursor:pointer;padding:10px 14px;font-weight:600;display:flex;align-items:center;gap:10px}
 .n{margin-left:auto;color:var(--mut);font-weight:400;font-size:13px}.dot{width:10px;height:10px;border-radius:50%;background:var(--ok)}
 .dot.warning{background:var(--warn)}.dot.critical,.dot.error{background:var(--crit)}.dot.info{background:var(--info)}.dot.skipped{background:var(--skip)}
 table{width:100%;border-collapse:collapse}td,th{padding:7px 14px;border-top:1px solid var(--line);text-align:left;vertical-align:top}
 .sec td:first-child{width:90px}.sec td:nth-child(2){width:28%;font-weight:500}th{color:var(--mut);font-weight:500;width:200px}
 .box{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:auto}
-@media (max-width:640px){.sec td:nth-child(2){width:auto}td,th{padding:6px 10px}th{width:auto}}
+@media (max-width:640px){.sec td:nth-child(2){width:auto}td,th{padding:6px 10px}th{width:auto}.chg{grid-template-columns:1fr}}
 </style></head><body><main>
 <h1>PC Diagnostic Report</h1>
-<div class="sub">$(& $e $env:COMPUTERNAME) &middot; $(Get-Date -Format 'yyyy-MM-dd HH:mm') &middot; event logs checked for the last $Days days$(if (-not $script:IsAdmin) { ' &middot; <b>not run as admin - some checks skipped</b>' })</div>
-<div class="hero" style="--ov:var(--$(@{OK='ok';Warning='warn';Critical='crit'}[$overall]))"><b>$headline</b>
+<div class="sub">$computer &middot; $generated &middot; event logs checked for the last $days days$adminNote</div>
+$shareNote
+<div class="hero" style="--ov:var(--$ovColor)"><b>$headline</b>
 <div class="counts"><span>Critical: $($counts.Critical)</span><span>Warning: $($counts.Warning)</span><span>Info: $($counts.Info)</span><span>OK: $($counts.OK)</span><span>Skipped: $($counts.Skipped)</span><span>Check errors: $($counts.Error)</span></div></div>
+<h2>Changes since the last scan</h2>
+$chgHtml
 <h2>Issues found</h2>
 $issueHtml
 <h2>All checks</h2>
 $catHtml
 <h2>System overview</h2>
 <div class="box"><table>$ovHtml</table></div>
-<h2>Installed programs ($(@($script:InstalledApps).Count))</h2>
-<details class="sec"><summary>Show list</summary><table>$appHtml</table></details>
-<p class="sub">Generated by Diagnostic-kun. Read-only: no changes were made to this PC.</p>
+$appSection
+<p class="sub">Generated by Diagnostic-kun $ver. Read-only: no changes were made to this PC.</p>
 </main></body></html>
 "@
-    Set-Content -Path "$base.html" -Value $html -Encoding UTF8
-    return [pscustomobject]@{ Html = "$base.html"; Json = "$base.json"; Overall = $overall; Counts = $counts }
+    Set-Content -Path $Path -Value $html -Encoding UTF8
+}
+
+# ===========================================================================
+# SCAN
+# ===========================================================================
+function Write-ScanProgress {
+    param([string]$Text)
+    if ($ProgressFile) { try { [IO.File]::WriteAllText($ProgressFile, $Text) } catch {} }
+}
+
+function Remove-OldReports {
+    param([string]$Dir)
+    $old = @(Get-ChildItem -Path $Dir -Filter "Diagnostic_$($env:COMPUTERNAME)_*.json" -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -Skip $script:KeepRuns)
+    foreach ($f in $old) {
+        $base = Join-Path $f.DirectoryName ([IO.Path]::GetFileNameWithoutExtension($f.Name))
+        foreach ($ext in '.json', '.html', '_shareable.html') { Remove-Item -LiteralPath ($base + $ext) -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-Scan {
+    $script:Results.Clear()
+    $script:Metrics.Clear()
+    $script:Overview = [ordered]@{}
+    $script:InstalledApps = @()
+
+    $checks = @(
+        @('System',       'System information',          ${function:Test-SystemInfo}),
+        @('CPU',          'Processor and load',          ${function:Test-Cpu}),
+        @('Temperatures', 'Temperatures and fans',       ${function:Test-Sensors}),
+        @('Memory',       'RAM',                         ${function:Test-Memory}),
+        @('Storage',      'Disks and volumes',           ${function:Test-Storage}),
+        @('Graphics',     'Graphics adapters',           ${function:Test-Gpu}),
+        @('Power',        'Battery',                     ${function:Test-Battery}),
+        @('Devices',      'Device Manager',              ${function:Test-Devices}),
+        @('Stability',    'Crashes and hardware errors', ${function:Test-HardwareErrors}),
+        @('Updates',      'Windows Update',              ${function:Test-WindowsUpdate}),
+        @('Security',     'Security settings',           ${function:Test-Security}),
+        @('OS Health',    'System file integrity',       ${function:Test-SystemFiles}),
+        @('Services',     'Windows services',            ${function:Test-Services}),
+        @('Drivers',      'Drivers',                     ${function:Test-Drivers}),
+        @('Applications', 'Program crashes',             ${function:Test-AppCrashes}),
+        @('Applications', 'Startup programs',            ${function:Test-Startup}),
+        @('Applications', 'Installed software',          ${function:Test-InstalledSoftware}),
+        @('OS Health',    'System event log',            ${function:Test-SystemEvents}),
+        @('OS Health',    'Housekeeping',                ${function:Test-Housekeeping}),
+        @('Network',      'Network',                     ${function:Test-Network})
+    )
+    $i = 0
+    foreach ($c in $checks) {
+        $i++
+        Write-ScanProgress "$i|$($checks.Count)|$($c[1])"
+        Invoke-Check $c[0] $c[1] $c[2]
+    }
+    Write-ScanProgress "$($checks.Count)|$($checks.Count)|Writing the report"
+
+    if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
+    $base = Join-Path $OutputDir ("Diagnostic_{0}_{1}" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
+    $counts = [ordered]@{}
+    foreach ($s in 'Critical', 'Error', 'Warning', 'Info', 'Skipped', 'OK') { $counts[$s] = @($script:Results | Where-Object { $_.Status -eq $s }).Count }
+    $data = [pscustomobject]@{
+        Tool       = 'Diagnostic-kun'
+        Version    = $script:Version
+        Generated  = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+        Computer   = $env:COMPUTERNAME
+        Days       = $Days
+        Quick      = [bool]$Quick
+        IsAdmin    = $script:IsAdmin
+        Overall    = Get-Overall $counts
+        Counts     = $counts
+        Overview   = $script:Overview
+        Results    = $script:Results.ToArray()
+        Metrics    = $script:Metrics.ToArray()
+        Installed  = @($script:InstalledApps)
+        Comparison = $null
+    }
+    $prev = Get-PreviousData -Dir $OutputDir -ExcludePath "$base.json"
+    if ($prev) { $data.Comparison = Compare-Runs $prev $data }
+
+    $data | ConvertTo-Json -Depth 6 | Set-Content -Path "$base.json" -Encoding UTF8
+    Write-Report -Data $data -Path "$base.html"
+    $share = $null
+    if ($Shareable) { $share = "$($base)_shareable.html"; Write-Report -Data $data -Path $share -Redact }
+    Remove-OldReports $OutputDir
+    Write-ScanProgress "done|$base.json|$base.html"
+    [pscustomobject]@{ Data = $data; Html = "$base.html"; Json = "$base.json"; Shareable = $share }
+}
+
+function Write-ConsoleSummary {
+    param($Run)
+    $d = $Run.Data
+    $color = @{ OK = 'Green'; Warning = 'Yellow'; Critical = 'Red' }[[string]$d.Overall]
+    Write-Host ''
+    Write-Host ("  Result: {0} - {1}  (Critical {2}, Warning {3}, OK {4}, could not run {5})" -f $d.Overall, (Get-Headline $d.Overall $d.Counts), $d.Counts.Critical, $d.Counts.Warning, $d.Counts.OK, $d.Counts.Error) -ForegroundColor $color
+    $cmp = $d.Comparison
+    if ($cmp) {
+        Write-Host ("  Since the last scan ({0}): {1} got worse, {2} improved." -f $cmp.Since, @($cmp.Worse).Count, @($cmp.Better).Count)
+        foreach ($w in (@($cmp.Worse) | Select-Object -First 5)) { Write-Host "    - $w" -ForegroundColor Yellow }
+    }
+    Write-Host "  Report: $($Run.Html)"
+    if ($Run.Shareable) { Write-Host "  Shareable copy (no PC name, user name or program list): $($Run.Shareable)" }
+    Write-Host "  Data:   $($Run.Json)"
+    Write-Host ''
+}
+
+# ===========================================================================
+# WEEKLY CHECK AND NOTIFICATIONS
+# ===========================================================================
+function Test-WeeklyCheck { [bool](Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue) }
+
+# Returns a description of when it runs, e.g. "Monday at 12:00".
+function Install-WeeklyCheck {
+    if (-not $script:IsAdmin) { throw 'Turning on the weekly check needs administrator rights. Start Diagnostic-kun with RunDiagnostic.bat.' }
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $argLine = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Scheduled -OutputDir `"$OutputDir`" -Days 7"
+    $day = (Get-Date).DayOfWeek
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $argLine
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $day -At '12:00'
+    # Runs as the signed-in user (so the notification is visible), with admin rights for the full check
+    $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    $null = Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+        -Description 'Weekly PC health check by Diagnostic-kun. Shows a notification only when something becomes critical.' -Force
+    "$day at 12:00"
+}
+
+function Remove-WeeklyCheck {
+    if (Test-WeeklyCheck) { Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false }
+}
+
+function Show-Notification {
+    param([string]$Title, [string]$Text, [string]$OpenPath)
+    $esc = { param($s) [Security.SecurityElement]::Escape([string]$s) }
+    try {
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+        $launch = ''
+        if ($OpenPath) { $launch = " activationType=`"protocol`" launch=`"$(& $esc ([Uri]$OpenPath).AbsoluteUri)`"" }
+        $xml = "<toast$launch><visual><binding template=`"ToastGeneric`"><text>$(& $esc $Title)</text><text>$(& $esc $Text)</text></binding></visual></toast>"
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml($xml)
+        # The app id of Windows PowerShell, so Windows accepts the notification without registering an app
+        $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($doc))
+    } catch {
+        # Fallback: a tray balloon
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $icon = New-Object System.Windows.Forms.NotifyIcon
+        $icon.Icon = [System.Drawing.SystemIcons]::Warning
+        $icon.Visible = $true
+        $icon.ShowBalloonTip(15000, $Title, $Text, [System.Windows.Forms.ToolTipIcon]::Warning)
+        Start-Sleep -Seconds 15
+        $icon.Dispose()
+    }
+}
+
+# ===========================================================================
+# WINDOW (-Gui)
+# ===========================================================================
+# The scan runs in a separate hidden PowerShell process that reports progress
+# through a small text file, so the window never freezes during slow checks.
+function Set-ConsoleVisible {
+    param([bool]$Visible)
+    try {
+        if (-not ('DiagKun.ConsoleWindow' -as [type])) {
+            Add-Type -Namespace DiagKun -Name ConsoleWindow -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+        }
+        $h = [DiagKun.ConsoleWindow]::GetConsoleWindow()
+        if ($h -ne [IntPtr]::Zero) { $null = [DiagKun.ConsoleWindow]::ShowWindow($h, $(if ($Visible) { 5 } else { 0 })) }
+    } catch {}
+}
+
+function New-Ctl {
+    param([string]$Type, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Text = '', [string]$Anchor = 'Top,Left')
+    $c = New-Object "System.Windows.Forms.$Type"
+    $c.Location = New-Object System.Drawing.Point($X, $Y)
+    $c.Size = New-Object System.Drawing.Size($W, $H)
+    if ($Text) { $c.Text = $Text }
+    $c.Anchor = [System.Windows.Forms.AnchorStyles]$Anchor
+    $c
+}
+
+function Show-Message {
+    param([string]$Text, [string]$Icon = 'Information')
+    [void][System.Windows.Forms.MessageBox]::Show($Text, 'Diagnostic-kun', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]$Icon)
+}
+
+# Event handlers run through this so an error shows a message instead of crashing the window.
+function Invoke-Safely {
+    param([scriptblock]$Body)
+    try { & $Body } catch { Show-Message "Something went wrong: $($_.Exception.Message)" 'Error' }
+}
+
+function Read-ScanProgress {
+    if (-not $script:GuiProgress) { return $null }
+    $t = $null
+    try { $t = [IO.File]::ReadAllText($script:GuiProgress) } catch { return $null }
+    if (-not $t) { return $null }
+    , $t.Split('|')
+}
+
+function Start-GuiScan {
+    $ui = $script:ui
+    Stop-GuiScan
+    $script:GuiProgress = Join-Path ([IO.Path]::GetTempPath()) ("dk_progress_{0}.txt" -f [guid]::NewGuid())
+    $argLine = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -NoOpen -ProgressFile `"$($script:GuiProgress)`" -OutputDir `"$OutputDir`" -Days $Days"
+    if ($Quick) { $argLine += ' -Quick' }
+    $script:ScanProc = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine -WindowStyle Hidden -PassThru
+    $null = $script:ScanProc.Handle
+    $ui.ResultsPanel.Visible = $false
+    $ui.ScanPanel.Visible = $true
+    $ui.Bar.Value = 0
+    $ui.Step.Text = 'Starting the scan...'
+    $ui.Timer.Start()
+}
+
+function Stop-GuiScan {
+    if ($script:ui -and $script:ui.Timer) { $script:ui.Timer.Stop() }
+    $p = $script:ScanProc
+    if ($p -and -not $p.HasExited) { try { $p.Kill() } catch {} }
+    if ($script:GuiProgress) { Remove-Item $script:GuiProgress -Force -ErrorAction SilentlyContinue }
+}
+
+function Complete-GuiScan {
+    param($State)
+    $script:ui.Timer.Stop()
+    Remove-Item $script:GuiProgress -Force -ErrorAction SilentlyContinue
+    $data = Get-Content $State[1] -Raw | ConvertFrom-Json
+    Show-GuiResults -Data $data -HtmlPath $State[2]
+}
+
+function Update-ScanState {
+    $ui = $script:ui
+    $state = Read-ScanProgress
+    if ($state -and $state[0] -eq 'done') { Complete-GuiScan $state; return }
+    if ($state -and $state.Count -ge 3) {
+        $i = 0; $n = 0
+        if ([int]::TryParse($state[0], [ref]$i) -and [int]::TryParse($state[1], [ref]$n) -and $n -gt 0) {
+            $ui.Bar.Value = [math]::Max(0, [math]::Min(100, [int](($i - 1) * 100 / $n)))
+            $ui.Step.Text = "Checking: $($state[2])   ($i of $n)"
+        }
+    }
+    if ($script:ScanProc -and $script:ScanProc.HasExited) {
+        $state = Read-ScanProgress   # it may have finished between the two reads
+        if ($state -and $state[0] -eq 'done') { Complete-GuiScan $state; return }
+        $ui.Timer.Stop()
+        $ui.Step.Text = "The scan stopped unexpectedly (exit code $($script:ScanProc.ExitCode)). Close this window and run RunDiagnostic.bat again."
+    }
+}
+
+function Show-GuiResults {
+    param($Data, [string]$HtmlPath)
+    $ui = $script:ui
+    $script:GuiData = $Data
+    $script:GuiHtml = $HtmlPath
+    $colors = @{
+        Critical = [System.Drawing.Color]::FromArgb(196, 40, 45)
+        Error    = [System.Drawing.Color]::FromArgb(196, 40, 45)
+        Warning  = [System.Drawing.Color]::FromArgb(178, 107, 0)
+        OK       = [System.Drawing.Color]::FromArgb(18, 128, 92)
+    }
+    $overall = [string]$Data.Overall
+    $c = $Data.Counts
+    $ui.Headline.Text = Get-Headline $overall $c
+    $ui.Headline.ForeColor = $colors[$overall]
+    $ui.Counts.Text = "Critical: $($c.Critical)    Warning: $($c.Warning)    Info: $($c.Info)    OK: $($c.OK)    Skipped: $($c.Skipped)    Could not run: $($c.Error)"
+
+    $cmp = Get-Prop $Data 'Comparison'
+    if ($cmp) {
+        $w = @(Get-Prop $cmp 'Worse' @() | Where-Object { $_ })
+        $b = @(Get-Prop $cmp 'Better' @() | Where-Object { $_ })
+        $txt = "Since the last scan ($(Get-Prop $cmp 'Since' '?')): $($w.Count) got worse, $($b.Count) improved."
+        if ($w.Count -gt 0) { $txt += '  ' + (($w | Select-Object -First 2) -join ';  ') }
+        $ui.Changes.Text = $txt
+    } else {
+        $ui.Changes.Text = 'First scan of this PC. Next time you will see what changed since this one.'
+    }
+
+    $order = @{ Critical = 0; Error = 1; Warning = 2 }
+    $issues = @(@($Data.Results) | Where-Object { $_ -and $order.ContainsKey([string]$_.Status) } | Sort-Object @{ e = { $order[[string]$_.Status] } })
+    $ui.List.BeginUpdate()
+    $ui.List.Items.Clear()
+    foreach ($r in $issues) {
+        $item = New-Object System.Windows.Forms.ListViewItem([string]$r.Status)
+        [void]$item.SubItems.Add([string]$r.Category)
+        [void]$item.SubItems.Add([string]$r.Check)
+        [void]$item.SubItems.Add([string]$r.Detail)
+        $item.ForeColor = $colors[[string]$r.Status]
+        [void]$ui.List.Items.Add($item)
+    }
+    if ($issues.Count -eq 0) {
+        $item = New-Object System.Windows.Forms.ListViewItem('OK')
+        [void]$item.SubItems.Add('')
+        [void]$item.SubItems.Add('No problems found')
+        [void]$item.SubItems.Add('Everything that was checked looks fine.')
+        $item.ForeColor = $colors['OK']
+        [void]$ui.List.Items.Add($item)
+    }
+    $ui.List.EndUpdate()
+
+    $script:GuiFixList = Get-AvailableFixes $Data.Results
+    $ui.Fixes.Items.Clear()
+    foreach ($fx in $script:GuiFixList) { [void]$ui.Fixes.Items.Add("$($fx.Title)    (for: $($fx.Reason))") }
+    $hasFixes = $script:GuiFixList.Count -gt 0
+    if (-not $hasFixes) { [void]$ui.Fixes.Items.Add('No automatic fixes for the problems found.') }
+    $ui.Fixes.Enabled = $hasFixes
+    $ui.RunFix.Enabled = $hasFixes
+    $ui.Open.Enabled = [bool]$HtmlPath
+    $ui.Share.Enabled = [bool]$HtmlPath
+    Update-WeeklyButton
+    $ui.ScanPanel.Visible = $false
+    $ui.ResultsPanel.Visible = $true
+}
+
+function Invoke-GuiFixes {
+    $ui = $script:ui
+    $chosen = @(foreach ($i in $ui.Fixes.CheckedIndices) { $script:GuiFixList[$i] })
+    if ($chosen.Count -eq 0) { Show-Message 'Tick the fixes you want to run first.'; return }
+    $msg = "Run these fixes?`n`n" + (($chosen | ForEach-Object { "- $($_.Title)" }) -join "`n")
+    $answer = [System.Windows.Forms.MessageBox]::Show($msg, 'Diagnostic-kun', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $ui.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try { $out = @(foreach ($c in @($chosen | Sort-Object Order)) { Invoke-Fix $c }) }
+    finally { $ui.Form.Cursor = [System.Windows.Forms.Cursors]::Default }
+    for ($i = 0; $i -lt $ui.Fixes.Items.Count; $i++) { $ui.Fixes.SetItemChecked($i, $false) }
+    Show-Message (($out -join "`n") + "`n`nClick ""Scan again"" to check the result.")
+}
+
+function Save-ShareableCopy {
+    $path = $script:GuiHtml -replace '\.html$', '_shareable.html'
+    Write-Report -Data $script:GuiData -Path $path -Redact
+    Start-Process explorer.exe -ArgumentList "/select,`"$path`""
+}
+
+function Update-WeeklyButton {
+    $script:ui.Weekly.Text = if (Test-WeeklyCheck) { 'Weekly check: ON (turn off)' } else { 'Turn on weekly check' }
+}
+
+function Switch-WeeklyCheck {
+    if (Test-WeeklyCheck) {
+        Remove-WeeklyCheck
+        Show-Message 'The weekly check is turned off.'
+    } else {
+        $when = Install-WeeklyCheck
+        Show-Message "The weekly check is on: every $when (or the next time the PC is on).`n`nYou only get a notification when something becomes critical. Keep this folder where it is - the check runs from here."
+    }
+    Update-WeeklyButton
+}
+
+function Show-DiagnosticWindow {
+    param([switch]$SelfTest)
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    $script:ScanProc = $null
+    $script:GuiProgress = $null
+    $script:GuiHtml = $null
+    $script:GuiData = $null
+    $script:GuiFixList = @()
+    $ui = @{}
+    $script:ui = $ui
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = "Diagnostic-kun $script:Version"
+    $f.ClientSize = New-Object System.Drawing.Size(900, 620)
+    $f.MinimumSize = New-Object System.Drawing.Size(780, 580)
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $f.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $f.BackColor = [System.Drawing.Color]::White
+    $ui.Form = $f
+
+    $title = New-Ctl Label 20 12 860 36 'PC health check' 'Top,Left,Right'
+    $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+    $sub = New-Ctl Label 22 50 860 24 'Checks your hardware and software. Nothing on the PC changes unless you choose a fix.' 'Top,Left,Right'
+    $sub.ForeColor = [System.Drawing.Color]::DimGray
+
+    # While scanning
+    $scan = New-Ctl Panel 20 90 860 110 '' 'Top,Left,Right'
+    $ui.Step = New-Ctl Label 0 0 860 24 'Starting the scan...' 'Top,Left,Right'
+    $ui.Bar = New-Ctl ProgressBar 0 30 860 22 '' 'Top,Left,Right'
+    $ui.Bar.Maximum = 100
+    $ui.Cancel = New-Ctl Button 0 66 110 32 'Cancel'
+    $scan.Controls.AddRange(@($ui.Step, $ui.Bar, $ui.Cancel))
+    $ui.ScanPanel = $scan
+
+    # After the scan
+    $res = New-Ctl Panel 20 82 860 528 '' 'Top,Bottom,Left,Right'
+    $res.Visible = $false
+    $ui.Headline = New-Ctl Label 0 0 860 32 '' 'Top,Left,Right'
+    $ui.Headline.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+    $ui.Counts = New-Ctl Label 0 34 860 22 '' 'Top,Left,Right'
+    $ui.Changes = New-Ctl Label 0 58 860 42 '' 'Top,Left,Right'
+    $ui.Changes.ForeColor = [System.Drawing.Color]::DimGray
+    $ui.List = New-Ctl ListView 0 102 860 196 '' 'Top,Bottom,Left,Right'
+    $ui.List.View = [System.Windows.Forms.View]::Details
+    $ui.List.FullRowSelect = $true
+    $ui.List.ShowItemToolTips = $true
+    foreach ($col in @(@('Status', 80), @('Area', 110), @('Check', 230), @('Details', 420))) { [void]$ui.List.Columns.Add($col[0], $col[1]) }
+    $fixLbl = New-Ctl Label 0 306 860 22 'Fixes you can run: tick them and click "Run selected fixes". Nothing runs until you confirm.' 'Bottom,Left,Right'
+    $ui.Fixes = New-Ctl CheckedListBox 0 330 860 128 '' 'Bottom,Left,Right'
+    $ui.Fixes.CheckOnClick = $true
+    $ui.Fixes.IntegralHeight = $false
+    $ui.RunFix = New-Ctl Button 0 470 170 36 'Run selected fixes' 'Bottom,Left'
+    $ui.Open = New-Ctl Button 180 470 150 36 'Open full report' 'Bottom,Left'
+    $ui.Share = New-Ctl Button 340 470 170 36 'Save shareable copy' 'Bottom,Left'
+    $ui.Weekly = New-Ctl Button 520 470 200 36 'Turn on weekly check' 'Bottom,Left'
+    $ui.Again = New-Ctl Button 730 470 130 36 'Scan again' 'Bottom,Left'
+    $res.Controls.AddRange(@($ui.Headline, $ui.Counts, $ui.Changes, $ui.List, $fixLbl, $ui.Fixes, $ui.RunFix, $ui.Open, $ui.Share, $ui.Weekly, $ui.Again))
+    $ui.ResultsPanel = $res
+
+    $f.Controls.AddRange(@($title, $sub, $scan, $res))
+
+    $ui.Timer = New-Object System.Windows.Forms.Timer
+    $ui.Timer.Interval = 300
+    $ui.Timer.add_Tick({ Invoke-Safely { Update-ScanState } })
+    $ui.Cancel.add_Click({ $script:ui.Form.Close() })
+    $ui.RunFix.add_Click({ Invoke-Safely { Invoke-GuiFixes } })
+    $ui.Open.add_Click({ Invoke-Safely { Start-Process $script:GuiHtml } })
+    $ui.Share.add_Click({ Invoke-Safely { Save-ShareableCopy } })
+    $ui.Weekly.add_Click({ Invoke-Safely { Switch-WeeklyCheck } })
+    $ui.Again.add_Click({ Invoke-Safely { Start-GuiScan } })
+    $f.add_FormClosing({ Stop-GuiScan })
+
+    if ($SelfTest) {
+        # Used by the automated tests: build the window and fill it from the latest saved report, without showing it
+        $last = Get-PreviousData -Dir $OutputDir -ExcludePath ''
+        if ($last) { Show-GuiResults -Data $last -HtmlPath 'selftest.html' }
+        $ui.Timer.Dispose()
+        $f.Dispose()
+        return
+    }
+
+    Set-ConsoleVisible $false
+    $f.add_Shown({ Invoke-Safely { Start-GuiScan } })
+    [void]$f.ShowDialog()
+    $ui.Timer.Dispose()
+    $f.Dispose()
 }
 
 # ===========================================================================
 # MAIN
 # ===========================================================================
-if ($env:OS -ne 'Windows_NT') { Write-Error 'This tool only runs on Windows.'; exit 2 }
+$script:PauseAtEnd = $false
 
-Write-Host ''
-Write-Host '  Diagnostic-kun - Windows PC health check' -ForegroundColor Cyan
-if (-not $script:IsAdmin) { Write-Host '  Not running as Administrator: some checks will be skipped.' -ForegroundColor Yellow }
-Write-Host ''
+if ($SensorProbe) { Invoke-SensorProbe -OutFile $SensorProbe; exit 0 }
+if ($InstallSchedule) { $when = Install-WeeklyCheck; Write-Host "Weekly check turned on: every $when."; exit 0 }
+if ($RemoveSchedule) { Remove-WeeklyCheck; Write-Host 'Weekly check turned off.'; exit 0 }
+if ($GuiSelfTest) { Show-DiagnosticWindow -SelfTest; Write-Host 'Window self-test passed.'; exit 0 }
 
-$script:Overview = [ordered]@{}
-$script:InstalledApps = @()
+if ($Gui) {
+    try {
+        Show-DiagnosticWindow
+        exit 0
+    } catch {
+        Set-ConsoleVisible $true
+        Write-Host "The window could not be shown ($($_.Exception.Message)). Running in this console instead." -ForegroundColor Yellow
+        $Fix = [switch]$true
+        $script:PauseAtEnd = $true
+    }
+}
 
-$checks = @(
-    @('System',       'System information',   ${function:Test-SystemInfo}),
-    @('CPU',          'Processor and load',   ${function:Test-Cpu}),
-    @('CPU',          'Temperatures',         ${function:Test-Thermal}),
-    @('Memory',       'RAM',                  ${function:Test-Memory}),
-    @('Storage',      'Disks and volumes',    ${function:Test-Storage}),
-    @('Graphics',     'Graphics adapters',    ${function:Test-Gpu}),
-    @('Power',        'Battery',              ${function:Test-Battery}),
-    @('Devices',      'Device Manager',       ${function:Test-Devices}),
-    @('Stability',    'Crashes and hardware errors', ${function:Test-HardwareErrors}),
-    @('Updates',      'Windows Update',       ${function:Test-WindowsUpdate}),
-    @('Security',     'Security settings',    ${function:Test-Security}),
-    @('OS Health',    'System file integrity',${function:Test-SystemFiles}),
-    @('Services',     'Windows services',     ${function:Test-Services}),
-    @('Drivers',      'Drivers',              ${function:Test-Drivers}),
-    @('Applications', 'Program crashes',      ${function:Test-AppCrashes}),
-    @('Applications', 'Startup programs',     ${function:Test-Startup}),
-    @('Applications', 'Installed software',   ${function:Test-InstalledSoftware}),
-    @('OS Health',    'System event log',     ${function:Test-SystemEvents}),
-    @('OS Health',    'Housekeeping',         ${function:Test-Housekeeping}),
-    @('Network',      'Network',              ${function:Test-Network})
-)
-$sw = [Diagnostics.Stopwatch]::StartNew()
-foreach ($c in $checks) { Invoke-Check $c[0] $c[1] $c[2] }
+try {
+    if (-not $Scheduled) {
+        Write-Host ''
+        Write-Host "  Diagnostic-kun $script:Version - Windows PC health check" -ForegroundColor Cyan
+        if (-not $script:IsAdmin) { Write-Host '  Not running as Administrator: some checks will be skipped.' -ForegroundColor Yellow }
+        Write-Host ''
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $run = Invoke-Scan
+    Write-ConsoleSummary $run
+    Write-Host ("  Finished in {0:N0}s" -f $sw.Elapsed.TotalSeconds)
 
-$r = Write-Report -Dir $OutputDir
-Write-Host ''
-$color = @{ OK = 'Green'; Warning = 'Yellow'; Critical = 'Red' }[$r.Overall]
-Write-Host ("  Result: {0}  (Critical {1}, Warning {2}, OK {3})  in {4:N0}s" -f $r.Overall, $r.Counts.Critical, $r.Counts.Warning, $r.Counts.OK, $sw.Elapsed.TotalSeconds) -ForegroundColor $color
-Write-Host "  Report: $($r.Html)"
-Write-Host "  Data:   $($r.Json)"
-Write-Host ''
-if (-not $NoOpen) { Start-Process $r.Html }
-
-# Exit code for scripting: 0 = OK, 1 = warnings, 2 = critical
-exit @{ OK = 0; Warning = 1; Critical = 2 }[$r.Overall]
+    if ($Scheduled) {
+        # Weekly task: notify only when something newly became critical
+        # (or on the first run, when anything is critical)
+        $cmp = $run.Data.Comparison
+        $newCrit = @(Get-Prop $cmp 'NewCritical' @() | Where-Object { $_ })
+        if ($newCrit.Count -gt 0 -or (-not $cmp -and $run.Data.Overall -eq 'Critical')) {
+            $what = if ($newCrit.Count -gt 0) { 'New: ' + (($newCrit | Select-Object -First 3) -join ', ') } else { Get-Headline $run.Data.Overall $run.Data.Counts }
+            Show-Notification 'Diagnostic-kun found a serious problem' "$what. Click to open the report." $run.Html
+        }
+    } else {
+        if (-not $NoOpen) { Start-Process $run.Html }
+        if ($Fix) { Invoke-FixMenu $run.Data }
+    }
+    if ($script:PauseAtEnd) { $null = Read-Host 'Press Enter to close' }
+    exit @{ OK = 0; Warning = 1; Critical = 2 }[[string]$run.Data.Overall]
+} catch {
+    Write-Host "Diagnostic-kun stopped with an error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace
+    exit 3
+}
