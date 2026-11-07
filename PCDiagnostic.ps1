@@ -117,12 +117,20 @@ function Format-GB { param([double]$Bytes) '{0:N1} GB' -f ($Bytes / 1GB) }
 function Get-Events {
     param([hashtable]$Filter, [int]$Max = 500)
     $Filter.StartTime = $Since
-    try { @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) }
+    try { $ev = @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction Stop) }
     catch {
-        # No matching events, or the provider/log does not exist on this PC
-        if ($_.Exception.Message -match 'No events were found|not an event provider|no event log|could not be found') { @() } else { throw }
+        # No matching events, or the provider/log does not exist on this PC.
+        # Match the error id, which is not translated, rather than the localized message.
+        if ($_.FullyQualifiedErrorId -match '^NoMatching(Events|Providers|Logs)Found' -or
+            $_.Exception.Message -match 'No events were found|not an event provider|no event log') { $ev = @() } else { throw }
     }
+    # The leading comma stops PowerShell unrolling a 0- or 1-item array into $null or a
+    # single object, so callers can always use .Count and [0].
+    return , $ev
 }
+
+# Shows "500+" when a query hit its -MaxEvents limit, so capped counts are not presented as exact.
+function Format-Count { param([int]$Count, [int]$Max) if ($Count -ge $Max) { "$Count+" } else { "$Count" } }
 
 # Runs an external program. Windows PowerShell 5.1 turns native stderr into
 # terminating errors when ErrorActionPreference is Stop, so relax it here.
@@ -162,13 +170,55 @@ function Test-SystemInfo {
         Add-Result 'System' 'Uptime' 'Warning' "Running for $d days without a restart." 'Restart the PC; long uptimes leave updates pending and memory fragmented.'
     } else { Add-Result 'System' 'Uptime' 'OK' "Up for $d days." }
 
-    # Support status of the Windows build (simple heuristic on build number)
+    # Support status of the Windows build: end-of-servicing dates (Microsoft lifecycle)
+    # per build and servicing channel. Home/Pro ("Consumer") and Enterprise/Education
+    # get different lengths; LTSC, IoT LTSC and Server have their own long lifecycles.
+    $eos = @{
+        10240 = @{ LTSC = '2025-10-14' }
+        14393 = @{ LTSC = '2026-10-13'; Server = '2027-01-12' }
+        17763 = @{ LTSC = '2029-01-09'; Server = '2029-01-09' }
+        19044 = @{ Consumer = '2023-06-13'; Enterprise = '2024-06-11'; LTSC = '2027-01-12'; IoT = '2032-01-13' }
+        19045 = @{ Consumer = '2025-10-14'; Enterprise = '2025-10-14' }
+        20348 = @{ Server = '2031-10-14' }
+        22000 = @{ Consumer = '2023-10-10'; Enterprise = '2024-10-08' }
+        22621 = @{ Consumer = '2024-10-08'; Enterprise = '2025-10-14' }
+        22631 = @{ Consumer = '2025-11-11'; Enterprise = '2026-11-10' }
+        26100 = @{ Consumer = '2026-10-13'; Enterprise = '2027-10-12'; LTSC = '2029-10-09'; IoT = '2034-10-10'; Server = '2034-10-10' }
+        26200 = @{ Consumer = '2027-10-12'; Enterprise = '2028-10-10' }
+    }
     $build = [int]$os.BuildNumber
-    if ($build -lt 19045) {
-        Add-Result 'System' 'Windows version' 'Critical' "Build $build is an old Windows release that no longer receives security updates." 'Upgrade to a supported Windows 10 22H2 / Windows 11 release.'
-    } elseif ($build -eq 19045) {
-        Add-Result 'System' 'Windows version' 'Warning' 'Windows 10 22H2. Mainstream Windows 10 support ended October 2025; updates only continue with ESU.' 'Plan an upgrade to Windows 11 or enrol in Extended Security Updates.'
-    } else { Add-Result 'System' 'Windows version' 'OK' "$($os.Caption) build $build." }
+    $edition = ''
+    try { $edition = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name EditionID -ErrorAction Stop).EditionID } catch {}
+    $channel = if ($os.ProductType -ne 1) { 'Server' }
+               elseif ($edition -match '^IoTEnterpriseS') { 'IoT' }
+               elseif ($edition -match '^EnterpriseS') { 'LTSC' }
+               elseif ($edition -match '^(Enterprise|Education|IoTEnterprise|ServerRdsh)') { 'Enterprise' }
+               else { 'Consumer' }
+    $end = $null
+    if ($eos.ContainsKey($build)) {
+        $try = @($channel)
+        if ($channel -eq 'IoT') { $try += 'LTSC' }
+        if ($channel -in 'IoT', 'LTSC') { $try += 'Enterprise' }
+        foreach ($ch in $try) { if ($eos[$build].ContainsKey($ch)) { $end = [datetime]$eos[$build][$ch]; break } }
+    }
+    $maxKnown = ($eos.Keys | Measure-Object -Maximum).Maximum
+    $label = "$($os.Caption) build $build"
+    $upgradeFix = 'Install the latest Windows feature update (Settings > Windows Update), or upgrade to a supported release.'
+    if (-not $end -and $build -gt $maxKnown) {
+        Add-Result 'System' 'Windows version' 'OK' "$label (newer than this tool's support table)."
+    } elseif (-not $end) {
+        Add-Result 'System' 'Windows version' 'Critical' "$label is an old Windows release that no longer receives security updates." $upgradeFix
+    } elseif ($end -lt (Get-Date)) {
+        if ($build -eq 19045) {
+            Add-Result 'System' 'Windows version' 'Warning' "Windows 10 22H2. Support ended $($end.ToString('yyyy-MM-dd')); updates only continue with Extended Security Updates (ESU)." 'Plan an upgrade to Windows 11 or enrol in Extended Security Updates.'
+        } else {
+            Add-Result 'System' 'Windows version' 'Critical' "$label - support for this release ended $($end.ToString('yyyy-MM-dd')); it no longer receives security updates." $upgradeFix
+        }
+    } elseif (($end - (Get-Date)).TotalDays -le 90) {
+        Add-Result 'System' 'Windows version' 'Warning' "$label - support ends $($end.ToString('yyyy-MM-dd'))." $upgradeFix
+    } else {
+        Add-Result 'System' 'Windows version' 'OK' "$label, supported until $($end.ToString('yyyy-MM-dd'))."
+    }
 }
 
 # ===========================================================================
@@ -238,8 +288,10 @@ function Test-Memory {
         if ($speeds.Count -gt 1 -or $sizes.Count -gt 1) {
             Add-Result 'Memory' 'RAM modules' 'Info' "Mixed modules installed - $desc." 'Mismatched sticks can disable dual-channel or cause instability.'
         } else { Add-Result 'Memory' 'RAM modules' 'OK' "$($mods.Count) module(s) - $desc." }
-        if ((Get-Cim Win32_ComputerSystem).TotalPhysicalMemory -lt 8GB) {
-            Add-Result 'Memory' 'RAM amount' 'Warning' "Only $(Format-GB $total) RAM. Windows 10/11 runs poorly below 8 GB." 'Upgrade RAM if the PC feels slow.'
+        # Installed capacity, not usable memory (which is reduced by firmware/iGPU reservations)
+        $installed = ($mods | Measure-Object -Property Capacity -Sum).Sum
+        if ($installed -lt 8GB) {
+            Add-Result 'Memory' 'RAM amount' 'Warning' "Only $(Format-GB $installed) RAM installed. Windows 10/11 runs poorly below 8 GB." 'Upgrade RAM if the PC feels slow.'
         }
     }
 
@@ -247,8 +299,9 @@ function Test-Memory {
     $md = Get-Events @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' } 5
     if ($md.Count -gt 0) {
         $last = $md[0]
-        $st = if ($last.Id -eq 1201) { 'OK' } else { 'Critical' }
-        Add-Result 'Memory' 'Memory test result' $st "Windows Memory Diagnostic ($($last.TimeCreated.ToString('yyyy-MM-dd'))): $($last.Message)" $(if ($st -ne 'OK') { 'Replace the failing RAM module.' } else { '' })
+        # 1101/1201 = no errors found, 1102/1202 = errors found
+        $st = if ($last.Id -in 1102, 1202) { 'Critical' } elseif ($last.Id -in 1101, 1201) { 'OK' } else { 'Info' }
+        Add-Result 'Memory' 'Memory test result' $st "Windows Memory Diagnostic ($($last.TimeCreated.ToString('yyyy-MM-dd'))): $($last.Message)" $(if ($st -eq 'Critical') { 'Replace the failing RAM module.' } else { '' })
     }
 }
 
@@ -264,7 +317,11 @@ function Test-Storage {
                 Add-Result 'Storage' "Disk health: $($d.FriendlyName)" 'Critical' "$name reports Unhealthy ($ops)." 'Back up NOW and replace this drive.'
             } elseif ($d.HealthStatus -eq 'Warning') {
                 Add-Result 'Storage' "Disk health: $($d.FriendlyName)" 'Warning' "$name reports Warning ($ops)." 'Back up your data and plan to replace this drive.'
-            } else { Add-Result 'Storage' "Disk health: $($d.FriendlyName)" 'OK' "$name - Healthy." }
+            } elseif ($d.HealthStatus -eq 'Healthy') {
+                Add-Result 'Storage' "Disk health: $($d.FriendlyName)" 'OK' "$name - Healthy."
+            } else {
+                Add-Result 'Storage' "Disk health: $($d.FriendlyName)" 'Info' "$name - health status '$($d.HealthStatus)': this drive or its controller does not report health." 'Check the drive with the manufacturer tool or CrystalDiskInfo.'
+            }
 
             if ($script:IsAdmin) {
                 $rc = $null
@@ -321,12 +378,11 @@ function Test-Storage {
         else { Add-Result 'Storage' "Free space $($v.DeviceID)" 'OK' $txt }
     }
 
-    # File system dirty bit
+    # File system dirty bit (read from WMI rather than parsing fsutil's translated output)
     if ($script:IsAdmin) {
-        foreach ($v in $vols) {
-            $out = (Invoke-Native 'fsutil.exe' @('dirty', 'query', $v.DeviceID)) -join ' '
-            if ($out -match 'is Dirty' -and $out -notmatch 'NOT Dirty') {
-                Add-Result 'Storage' "File system $($v.DeviceID)" 'Warning' "Volume $($v.DeviceID) is marked dirty (file system errors suspected)." "Run: chkdsk $($v.DeviceID) /f  (may need a restart)."
+        foreach ($wv in @(Get-Cim Win32_Volume -Filter 'DriveType=3')) {
+            if ($wv.DirtyBitSet -and $wv.DriveLetter) {
+                Add-Result 'Storage' "File system $($wv.DriveLetter)" 'Warning' "Volume $($wv.DriveLetter) is marked dirty (file system errors suspected)." "Run: chkdsk $($wv.DriveLetter) /f  (may need a restart)."
             }
         }
     }
@@ -475,23 +531,34 @@ function Test-WindowsUpdate {
 
 function Test-Security {
     # Antivirus
-    try {
-        $mp = Get-MpComputerStatus -ErrorAction Stop
-        if (-not $mp.AntivirusEnabled -or -not $mp.RealTimeProtectionEnabled) {
-            $other = @()
-            try { $other = @(Get-Cim AntiVirusProduct -Namespace 'root/SecurityCenter2' | Where-Object { $_.displayName -notmatch 'Defender' }) } catch {}
-            if ($other.Count -gt 0) {
-                Add-Result 'Security' 'Antivirus' 'OK' "Third-party antivirus active: $(($other.displayName) -join ', ')."
-            } else {
-                Add-Result 'Security' 'Antivirus' 'Critical' 'Microsoft Defender real-time protection is off and no other antivirus was found.' 'Turn on real-time protection in Windows Security.'
-            }
+    $mp = $null
+    try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch {}   # fails when the Defender service is stopped/disabled
+    if (-not $mp -or -not $mp.AntivirusEnabled -or -not $mp.RealTimeProtectionEnabled) {
+        # Defender is off or cannot be queried: look for another antivirus that is actually turned on.
+        # productState bit 0x1000 = real-time protection on, bit 0x10 = signatures out of date.
+        $other = @()
+        try { $other = @(Get-Cim AntiVirusProduct -Namespace 'root/SecurityCenter2' | Where-Object { $_.displayName -notmatch 'Defender' }) } catch {}
+        $on = @($other | Where-Object { ([int64]$_.productState -band 0x1000) -ne 0 })
+        $stale = @($on | Where-Object { ([int64]$_.productState -band 0x10) -ne 0 })
+        if ($stale.Count -gt 0) {
+            Add-Result 'Security' 'Antivirus' 'Warning' "Third-party antivirus is on but its signatures are out of date: $(($stale.displayName) -join ', ')." 'Open the antivirus program and update it, or renew its subscription.'
+        } elseif ($on.Count -gt 0) {
+            Add-Result 'Security' 'Antivirus' 'OK' "Third-party antivirus active: $(($on.displayName) -join ', ')."
+        } elseif (-not $mp) {
+            $offNote = if ($other.Count -gt 0) { " ($(($other.displayName) -join ', ') is installed but turned off)" } else { '' }
+            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender could not be queried (its service may be stopped) and no active antivirus was found$offNote." 'Open Windows Security > Virus & threat protection and turn protection on, or re-enable your antivirus.'
         } else {
-            $sigAge = [math]::Round(((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalDays, 1)
-            $txt = "Microsoft Defender on. Signatures $sigAge day(s) old."
-            if ($sigAge -ge $T.DefSigCritDays) { Add-Result 'Security' 'Antivirus' 'Critical' $txt 'Update signatures: Windows Security > Virus protection > Check for updates.' }
-            elseif ($sigAge -ge $T.DefSigWarnDays) { Add-Result 'Security' 'Antivirus' 'Warning' $txt 'Update antivirus signatures.' }
-            else { Add-Result 'Security' 'Antivirus' 'OK' $txt }
+            $offNote = if ($other.Count -gt 0) { " ($(($other.displayName) -join ', ') is installed but turned off)" } else { '' }
+            Add-Result 'Security' 'Antivirus' 'Critical' "Microsoft Defender real-time protection is off and no other active antivirus was found$offNote." 'Turn on real-time protection in Windows Security.'
         }
+    } else {
+        $sigAge = [math]::Round(((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalDays, 1)
+        $txt = "Microsoft Defender on. Signatures $sigAge day(s) old."
+        if ($sigAge -ge $T.DefSigCritDays) { Add-Result 'Security' 'Antivirus' 'Critical' $txt 'Update signatures: Windows Security > Virus protection > Check for updates.' }
+        elseif ($sigAge -ge $T.DefSigWarnDays) { Add-Result 'Security' 'Antivirus' 'Warning' $txt 'Update antivirus signatures.' }
+        else { Add-Result 'Security' 'Antivirus' 'OK' $txt }
+    }
+    if ($mp) {
         $threats = @()
         try { $threats = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -ge $Since }) } catch {}
         if ($threats.Count -gt 0) {
@@ -499,8 +566,6 @@ function Test-Security {
             $sev = if ($active.Count -gt 0) { 'Critical' } else { 'Warning' }
             Add-Result 'Security' 'Malware detections' $sev "$($threats.Count) threat detection(s) in the last $Days days, $($active.Count) not yet resolved." 'Open Windows Security > Protection history and run a full scan.'
         } else { Add-Result 'Security' 'Malware detections' 'OK' "No threats detected in the last $Days days." }
-    } catch {
-        Add-Result 'Security' 'Antivirus' 'Info' 'Could not query Microsoft Defender (a third-party antivirus may replace it).'
     }
 
     # Firewall
@@ -575,8 +640,15 @@ function Test-SystemFiles {
 function Test-Services {
     # Auto-start services that are not running (ignoring ones that normally stop by design)
     $ignore = 'gupdate|edgeupdate|MapsBroker|RemoteRegistry|sppsvc|WbioSrvc|TrustedInstaller|GoogleUpdater|BITS|wuauserv|ShellHWDetection|tiledatamodelsvc|CDPSvc|clr_optimization|dbupdate|UsoSvc|WaaSMedicSvc|WMPNetworkSvc|DoSvc|Intel.*Update|VSStandardCollector'
-    $svc = @(Get-Cim Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" |
-             Where-Object { $_.Name -notmatch $ignore -and $_.DelayedAutoStart -ne $true })
+    # Per-user service templates (registry Type has 0x40 set, e.g. CDPUserSvc) never run
+    # themselves; their CDPUserSvc_xxxxx instances do.
+    $isUserTemplate = {
+        param($n)
+        try { ((Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$n" -Name Type -ErrorAction Stop).Type -band 0x40) -ne 0 } catch { $false }
+    }
+    # ExitCode 0 = the service stopped cleanly on its own (trigger-start services do this).
+    $svc = @(Get-Cim Win32_Service -Filter "StartMode='Auto' AND State<>'Running' AND ExitCode<>0" |
+             Where-Object { $_.Name -notmatch $ignore -and $_.DelayedAutoStart -ne $true -and -not (& $isUserTemplate $_.Name) })
     $critical = 'EventLog|Winmgmt|RpcSs|Dhcp|Dnscache|LanmanWorkstation|mpssvc|WinDefend|CryptSvc|Audiosrv|AudioEndpointBuilder|Schedule|Themes|nsi|BFE|ProfSvc|Power|PlugPlay'
     foreach ($s in $svc) {
         $sev = if ($s.Name -match "^($critical)$") { 'Critical' } else { 'Warning' }
@@ -586,8 +658,9 @@ function Test-Services {
 
     $svcCrash = Get-Events @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034 } 200
     if ($svcCrash.Count -gt 3) {
-        $names = ($svcCrash | ForEach-Object { if ($_.Message -match '^The (.+?) service') { $Matches[1] } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
-        Add-Result 'Services' 'Service crashes' 'Warning' "$($svcCrash.Count) unexpected service terminations in the last $Days days: $names." 'Update or reinstall the software that owns these services.'
+        # Event property 0 is the service name (language-independent, unlike the message text)
+        $names = ($svcCrash | ForEach-Object { if ($_.Properties.Count -gt 0) { [string]$_.Properties[0].Value } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
+        Add-Result 'Services' 'Service crashes' 'Warning' "$(Format-Count $svcCrash.Count 200) unexpected service terminations in the last $Days days: $names." 'Update or reinstall the software that owns these services.'
     }
 }
 
@@ -600,7 +673,7 @@ function Test-AppCrashes {
              Group-Object | Sort-Object Count -Descending | Select-Object -First 8
     $list = ($byApp | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
     $sev = if ($all.Count -ge $T.AppCrashWarn) { 'Warning' } else { 'Info' }
-    Add-Result 'Applications' 'Program crashes' $sev "$($crashes.Count) crash(es) and $($hangs.Count) hang(s) in the last $Days days: $list." 'Update or reinstall the programs that crash most often.'
+    Add-Result 'Applications' 'Program crashes' $sev "$(Format-Count $crashes.Count 500) crash(es) and $(Format-Count $hangs.Count 500) hang(s) in the last $Days days: $list." 'Update or reinstall the programs that crash most often.'
 }
 
 function Test-Startup {
@@ -642,7 +715,8 @@ function Test-InstalledSoftware {
     # Known end-of-life / risky software
     $eol = @(
         @{ P = '^Adobe Flash'; W = 'Adobe Flash Player is discontinued and insecure.' },
-        @{ P = '^Java.*\b(6|7)\b|^Java\(TM\) (6|7)'; W = 'Very old Java runtime with known security holes.' },
+        # Major version only, e.g. "Java 7 Update 80", "Java(TM) SE Development Kit 6 Update 45" (not "JDK 17.0.6")
+        @{ P = '^Java(\(TM\))?( SE (Development Kit|Runtime Environment))? (6|7) Update\b'; W = 'Very old Java runtime with known security holes.' },
         @{ P = '^Microsoft Silverlight'; W = 'Silverlight is discontinued.' },
         @{ P = '^Python 2\.'; W = 'Python 2 is end-of-life.' },
         @{ P = '^Microsoft Office.*20(07|10|13)'; W = 'This Office version no longer receives security updates.' },
@@ -672,10 +746,12 @@ function Test-Drivers {
 }
 
 function Test-SystemEvents {
+    # Fetch more errors than the warning threshold so the threshold can always be reached
+    $errMax = [math]::Max(1000, 20 * $Days + 1)
     $crit = Get-Events @{ LogName = 'System'; Level = 1 } 200
-    $err = Get-Events @{ LogName = 'System'; Level = 2 } 1000
+    $err = Get-Events @{ LogName = 'System'; Level = 2 } $errMax
     $top = ($err | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
-    $txt = "$($crit.Count) critical and $($err.Count) error events in the System log over $Days days. Top sources: $top."
+    $txt = "$(Format-Count $crit.Count 200) critical and $(Format-Count $err.Count $errMax) error events in the System log over $Days days. Top sources: $top."
     if ($crit.Count -gt 0) { Add-Result 'OS Health' 'System event log' 'Warning' $txt 'Open Event Viewer > Windows Logs > System for details. Specific causes are listed in other sections.' }
     elseif ($err.Count -gt (20 * $Days)) { Add-Result 'OS Health' 'System event log' 'Warning' $txt 'An unusually high error rate; check the top sources.' }
     else { Add-Result 'OS Health' 'System event log' 'OK' $txt }
@@ -703,17 +779,19 @@ function Test-Housekeeping {
         }
     }
 
-    # Time sync
+    # Time sync (service state via Get-Service, which is not translated; w32tm text is English-only)
     try {
+        $w32svc = Get-Service W32Time -ErrorAction SilentlyContinue
         $w32 = (Invoke-Native 'w32tm.exe' @('/query', '/status')) -join "`n"
-        if ($w32 -match 'Last Successful Sync Time:\s*(.+)') {
+        # On home PCs the service is trigger-started and is often stopped between syncs; only Disabled is a fault.
+        if ($w32svc -and $w32svc.StartType -eq 'Disabled') {
+            Add-Result 'OS Health' 'Clock sync' 'Warning' 'Windows Time service is disabled; the clock may drift and break HTTPS/logins.' 'Set the "Windows Time" service to Manual in services.msc, then sync in Settings > Time & language.'
+        } elseif ($w32 -match 'Last Successful Sync Time:\s*(.+)') {
             $ls = $Matches[1].Trim()
             $dt = [datetime]::MinValue
             if ([datetime]::TryParse($ls, [ref]$dt) -and ((Get-Date) - $dt).TotalDays -gt 14) {
                 Add-Result 'OS Health' 'Clock sync' 'Warning' "Clock last synced $ls." 'Settings > Time & language > Sync now.'
             } else { Add-Result 'OS Health' 'Clock sync' 'OK' "Last time sync: $ls." }
-        } elseif ($w32 -match 'service has not been started') {
-            Add-Result 'OS Health' 'Clock sync' 'Warning' 'Windows Time service is not running; the clock may drift and break HTTPS/logins.' 'Start the "Windows Time" service.'
         }
     } catch {}
 
@@ -722,7 +800,8 @@ function Test-Housekeeping {
         $plan = (Invoke-Native 'powercfg.exe' @('/getactivescheme')) -join ''
         if ($plan -match '\((.+)\)') {
             $name = $Matches[1]
-            if ($name -match 'saver') { Add-Result 'Power' 'Power plan' 'Info' "Active plan: $name - performance is reduced." 'Switch to Balanced if the PC feels slow.' }
+            # Match the built-in Power saver plan by its GUID; plan names are translated
+            if ($plan -match 'a1841308-3541-4fab-bc81-f71556f20b4a') { Add-Result 'Power' 'Power plan' 'Info' "Active plan: $name - performance is reduced." 'Switch to Balanced if the PC feels slow.' }
             else { Add-Result 'Power' 'Power plan' 'OK' "Active plan: $name." }
         }
     } catch {}
@@ -736,7 +815,9 @@ function Test-Network {
     }
     foreach ($a in $up) { Add-Result 'Network' "Adapter: $($a.Name)" 'OK' "$($a.InterfaceDescription), $($a.LinkSpeed)." }
 
-    $apipa = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like '169.254.*' })
+    # Only connected adapters: disconnected Bluetooth / Wi-Fi Direct adapters normally hold 169.254 addresses
+    $upIdx = @($up | Select-Object -ExpandProperty InterfaceIndex)
+    $apipa = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like '169.254.*' -and $_.InterfaceIndex -in $upIdx })
     if ($apipa.Count -gt 0) {
         Add-Result 'Network' 'IP address' 'Warning' "Adapter(s) have no DHCP address (169.254.x.x): $(($apipa.InterfaceAlias) -join ', ')." 'Restart the router, or run: ipconfig /release && ipconfig /renew'
     }
@@ -792,10 +873,11 @@ function Write-Report {
     $order = @{ Critical = 0; Error = 1; Warning = 2; Info = 3; Skipped = 4; OK = 5 }
     $counts = @{}
     foreach ($s in $order.Keys) { $counts[$s] = @($script:Results | Where-Object Status -eq $s).Count }
-    $overall = if ($counts.Critical -gt 0) { 'Critical' } elseif ($counts.Warning -gt 0) { 'Warning' } else { 'OK' }
+    # A check that could not run is not a clean result, so it raises the overall status to Warning
+    $overall = if ($counts.Critical -gt 0) { 'Critical' } elseif ($counts.Warning -gt 0 -or $counts.Error -gt 0) { 'Warning' } else { 'OK' }
     $headline = switch ($overall) {
         'Critical' { "$($counts.Critical) serious problem(s) need attention" }
-        'Warning'  { "$($counts.Warning) issue(s) worth looking at" }
+        'Warning'  { if ($counts.Warning -gt 0) { "$($counts.Warning) issue(s) worth looking at" } else { "$($counts.Error) check(s) could not run" } }
         default    { 'No problems found' }
     }
 
