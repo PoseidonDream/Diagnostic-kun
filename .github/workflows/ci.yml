@@ -2,7 +2,7 @@ name: Build and test
 
 # Runs on every push to main and on pull requests: builds the zip and tests it on
 # a real Windows machine. To publish a release: Actions > "Build and test" >
-# "Run workflow", and enter a version number.
+# "Run workflow", enter a version number (required), and click "Run workflow".
 on:
   push:
     branches: [main]
@@ -10,9 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'To publish a release, enter a version number like 0.2.0. Leave empty to only build and test.'
-        required: false
-        default: ''
+        description: 'Version number for the new release, like 0.2.1'
+        required: true
       prerelease:
         description: 'Mark the release as a pre-release'
         type: boolean
